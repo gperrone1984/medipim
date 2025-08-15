@@ -8,26 +8,64 @@ st.set_page_config(page_title="PDM • Product Description Builder", page_icon="
 
 APP_TITLE = st.secrets.get("APP_TITLE", "PDM • Product Description Builder")
 APP_FOOTER = st.secrets.get("APP_FOOTER", "")
-MODEL = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
 
-# API key
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    st.error("Missing OPENAI_API_KEY. Add it to .streamlit/secrets.toml or env vars.")
+# Provider e modello (da secrets)
+PROVIDER = (st.secrets.get("PROVIDER") or os.getenv("LLM_PROVIDER") or "groq").lower()
+BASE_URL = st.secrets.get("BASE_URL") or os.getenv("LLM_BASE_URL")
+MODEL = st.secrets.get("MODEL") or os.getenv("LLM_MODEL")
+
+# ---------- API key & client ----------
+def _pick_api_key() -> str:
+    # Priorità: chiave generica -> provider-specific -> OPENAI (fallback)
+    return (
+        st.secrets.get("API_KEY") or os.getenv("LLM_API_KEY")
+        or st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
+        or st.secrets.get("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        or st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    )
+
+API_KEY = _pick_api_key()
+
+# Default sensati per i provider gratuiti
+if not BASE_URL:
+    BASE_URL = "https://api.groq.com/openai/v1" if PROVIDER == "groq" else (
+        "https://openrouter.ai/api/v1" if PROVIDER == "openrouter" else None
+    )
+
+# Modello di default se non impostato
+if not MODEL:
+    if PROVIDER == "groq":
+        MODEL = "llama-3.1-70b-instruct"  # alternativa più leggera: "llama-3.1-8b-instruct"
+    elif PROVIDER == "openrouter":
+        MODEL = "meta-llama/llama-3.1-70b-instruct"
+
+if not API_KEY or not BASE_URL or not MODEL:
+    st.error(
+        "Configurazione API mancante. Imposta PROVIDER, BASE_URL, MODEL e la relativa API key "
+        "in .streamlit/secrets.toml (vedi esempi nel messaggio)."
+    )
     st.stop()
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Header extra richiesti da OpenRouter
+default_headers = None
+if PROVIDER == "openrouter":
+    site = st.secrets.get("OPENROUTER_SITE_URL") or os.getenv("OPENROUTER_SITE_URL") or "https://example.com"
+    appn = st.secrets.get("OPENROUTER_APP_NAME") or os.getenv("OPENROUTER_APP_NAME") or "PDM Product Description Builder"
+    default_headers = {
+        "HTTP-Referer": site,
+        "X-Title": appn,
+    }
+
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL, default_headers=default_headers)
 
 # ---------- Helpers ----------
 EAN_REGEX = re.compile(r"^[0-9]{8}$|^[0-9]{12,14}$")  # EAN8/UPC/EAN13/GTIN
-
 
 def valid_ean(code: str) -> bool:
     if not code:
         return False
     c = re.sub(r"[^0-9]", "", code)
     return bool(EAN_REGEX.match(c))
-
 
 # ---------- Prompting ----------
 def build_system_prompt():
@@ -66,8 +104,7 @@ Dati disponibili:
 Nota: se il prodotto è un farmaco da banco, mantieni un tono informativo e conforme; per cosmetici/integratori evita claim medici.
 """.strip()
 
-
-def call_openai(ean: str, user_prompt: str, tone: str, lang: str, include_bullets: bool, include_meta: bool):
+def call_llm(ean: str, user_prompt: str, tone: str, lang: str, include_bullets: bool, include_meta: bool):
     sys_prompt = build_system_prompt()
     prompt = PROMPT_TEMPLATE.format(
         ean=ean.strip(),
@@ -80,7 +117,6 @@ def call_openai(ean: str, user_prompt: str, tone: str, lang: str, include_bullet
     )
 
     try:
-        # Endpoint compatibile e semplice da debuggare
         resp = client.chat.completions.create(
             model=MODEL,
             messages=[
@@ -89,15 +125,13 @@ def call_openai(ean: str, user_prompt: str, tone: str, lang: str, include_bullet
             ],
             temperature=0.7,
         )
-        # SDK v1.x restituisce oggetti con attributi; compatibilità dict[]
         try:
             return resp.choices[0].message.content
         except Exception:
             return resp.choices[0].message["content"]
     except Exception as e:
-        st.error(f"Errore chiamando OpenAI: {e}")
+        st.error(f"Errore chiamando il provider ({PROVIDER}): {e}")
         return ""
-
 
 # ---------- UI ----------
 st.title("🧪 " + APP_TITLE)
@@ -128,7 +162,7 @@ if submitted:
         st.warning("Inserisci un EAN/GTIN valido (8/12/13/14 cifre).")
         st.stop()
 
-    result = call_openai(ean, user_prompt, tone, lang, include_bullets, include_meta)
+    result = call_llm(ean, user_prompt, tone, lang, include_bullets, include_meta)
 
     st.subheader("Risultato")
     if result:

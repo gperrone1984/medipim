@@ -2,6 +2,8 @@ import os
 import re
 import html
 import json
+import time
+import urllib.parse
 import streamlit as st
 import requests
 from openai import OpenAI
@@ -34,7 +36,7 @@ if not BASE_URL:
 
 if not MODEL:
     if PROVIDER == "groq":
-        MODEL = "llama-3.1-8b-instant"  # rapido e gratuito
+        MODEL = "llama-3.1-8b-instant"   # gratuito/veloce su Groq
     elif PROVIDER == "openrouter":
         MODEL = "meta-llama/llama-3.1-70b-instruct"
     else:
@@ -103,24 +105,20 @@ Dati disponibili:
 Nota: per farmaci da banco, tono informativo e conforme; per cosmetici/integratori evita claim medici.
 """.strip()
 
-# ---------- Web lookup da EAN ----------
-# 1) Open Beauty Facts / Open Food Facts (free, senza chiavi)
+# ---------- Web lookup da EAN (robusto) ----------
 OBF_API = "https://world.openbeautyfacts.org/api/v0/product/{ean}.json"
 OFF_API = "https://world.openfoodfacts.org/api/v0/product/{ean}.json"
-
-# 2) Fallback HTML "a firma" (aggiungi siti qui se vuoi ampliare)
-CANDIDATE_URLS = [
-    # Esempi di e-commerce dove spesso l'EAN compare nella pagina (personalizza liberamente)
+CANDIDATE_SEARCH_PAGES = [
     "https://www.tuttofarma.it/search?controller=search&s={ean}",
     "https://www.topfarmacia.it/ricerca?controller=search&s={ean}",
     "https://www.amicafarmacia.com/catalogsearch/result/?q={ean}",
     "https://www.farmaciaigea.com/ricerca?controller=search&s={ean}",
-    "https://www.amazon.it/s?k={ean}",
 ]
+UA_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; PDM-Builder/1.0)"}
 
 def _http_get(url: str, timeout=8):
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
+        r = requests.get(url, timeout=timeout, headers=UA_HEADERS, allow_redirects=True)
         if r.ok:
             return r
     except Exception:
@@ -128,41 +126,87 @@ def _http_get(url: str, timeout=8):
     return None
 
 def _clean_text(t: str) -> str:
-    t = html.unescape(t or "")
+    if not t:
+        return ""
+    t = html.unescape(t)
     t = re.sub(r"\s+", " ", t)
     return t.strip()
-
-def _pick_qty(name: str) -> str:
-    if not name:
-        return ""
-    m = re.search(r"(\d{1,4}\s?(?:ml|mL|ML|g|G|kg|KG|capsule|compresse|p(?:z|z\.)?))\b", name)
-    return m.group(1).replace("ML","ml").replace("KG","kg") if m else ""
-
-def _pick_form(name: str) -> str:
-    if not name: return ""
-    lowers = name.lower()
-    for k in ["olio", "crema", "gel", "spray", "lozione", "shampoo", "balsamo", "capsule", "compresse", "gocce"]:
-        if k in lowers:
-            return k
-    return ""
 
 def _dedupe_words(s: str) -> str:
     seen, out = set(), []
     for w in s.split():
-        if w.lower() not in seen:
-            out.append(w); seen.add(w.lower())
+        wl = w.lower()
+        if wl not in seen:
+            out.append(w); seen.add(wl)
     return " ".join(out)
 
-def fetch_from_open_dbs(ean: str):
-    """Prova Open Beauty Facts e Open Food Facts."""
-    sources = []
-    data = {}
+def _pick_qty(name: str) -> str:
+    if not name:
+        return ""
+    m = re.search(r"\b(\d{1,4}\s?(?:ml|g|kg|capsule|compresse|pz|p\.z\.))\b", name, re.I)
+    return m.group(1).lower() if m else ""
 
+def _pick_form(name: str) -> str:
+    if not name: return ""
+    lowers = name.lower()
+    for k in ["olio", "crema", "gel", "spray", "lozione", "shampoo", "balsamo", "capsule", "compresse", "gocce", "sciroppo", "latte", "siero"]:
+        if k in lowers:
+            return k
+    return ""
+
+def normalize_ean_variants(ean: str):
+    s = re.sub(r"\D+", "", ean)
+    variants = {s}
+    if len(s) == 14 and s.startswith("0"):
+        variants.add(s[1:])
+    if len(s) == 13:
+        variants.add("0" + s)
+        if s.startswith("0"):
+            variants.add(s[1:])
+    if len(s) == 12:
+        variants.add("0" + s)
+    return list(variants)
+
+def extract_title_and_h1(html_text: str):
+    t = ""
+    m = re.search(r"<title>(.{5,200}?)</title>", html_text, re.I | re.S)
+    if m: t = _clean_text(m.group(1))
+    if not t:
+        m = re.search(r"<meta\s+property=['\"]og:title['\"][^>]*content=['\"]([^'\"]{5,200})", html_text, re.I)
+        if m: t = _clean_text(m.group(1))
+    h1 = ""
+    m = re.search(r"<h1[^>]*>(.{5,200}?)</h1>", html_text, re.I | re.S)
+    if m: h1 = _clean_text(m.group(1))
+    return t, h1
+
+def extract_brand_and_ingredients(html_text: str):
+    brand = ""
+    ingred = ""
+    m = re.search(r"(?:Brand|Marca)\s*[:\-]\s*([A-Za-z0-9 \-\’\'®™]{2,60})", html_text, re.I)
+    if m: brand = _clean_text(m.group(1))
+    for pat in [
+        r"(?:INCI|INGREDIENTI|Ingredients)\s*[:\-]?\s*</?\w*>\s*([^<]{10,1200})",
+        r"(?:INCI|INGREDIENTI|Ingredients)\s*[:\-]\s*([^<]{10,1200})",
+    ]:
+        m = re.search(pat, html_text, re.I)
+        if m:
+            ingred = _clean_text(m.group(1))
+            break
+    return brand, ingred
+
+def page_contains_any_ean(html_text: str, variants):
+    for v in variants:
+        patt = r"%s" % re.sub(r"(\d)", r"\1[ \.\-]?", v)
+        if re.search(patt, html_text):
+            return True
+    return False
+
+def fetch_from_open_dbs(ean: str):
+    sources, data = [], {}
     for base in (OBF_API, OFF_API):
         url = base.format(ean=ean)
         r = _http_get(url)
-        if not r:
-            continue
+        if not r: continue
         try:
             j = r.json()
         except Exception:
@@ -170,7 +214,6 @@ def fetch_from_open_dbs(ean: str):
         if j.get("status") != 1:
             continue
         p = j.get("product", {})
-        # Campi utili (best-effort, variano per dataset)
         name = p.get("product_name") or p.get("generic_name") or ""
         brand = ""
         if isinstance(p.get("brands_tags"), list) and p["brands_tags"]:
@@ -179,93 +222,85 @@ def fetch_from_open_dbs(ean: str):
             brand = p["brands"].split(",")[0].strip()
         qty = p.get("quantity") or _pick_qty(name)
         form = _pick_form(name)
-        ingred = p.get("ingredients_text") or p.get("ingredients_text_it") or ""
-
-        # Se non c'è nulla di utile, salta
-        if not any([name, brand, qty, form, ingred]):
-            continue
-
-        data.update({
-            "name": _clean_text(name),
-            "brand": _clean_text(brand),
-            "quantity": _clean_text(qty),
-            "form": _clean_text(form),
-            "ingredients": _clean_text(ingred),
-            "category": "cosmetico" if base == OBF_API else "",
-        })
-        sources.append(url)
-
-        # Se abbiamo nome+brand, ci basta
-        if data.get("name") and data.get("brand"):
+        ingred = p.get("ingredients_text_it") or p.get("ingredients_text") or ""
+        if any([name, brand, qty, form, ingred]):
+            data.update({
+                "name": _clean_text(name),
+                "brand": _clean_text(brand),
+                "quantity": _clean_text(qty),
+                "form": _clean_text(form),
+                "ingredients": _clean_text(ingred),
+                "category": "cosmetico" if base == OBF_API else "",
+            })
+            sources.append(url)
             break
-
     return data, sources
 
-def fetch_from_html(ean: str, limit_pages=3):
-    """Fallback HTML: prova alcune ricerche e scrapa i primi titoli utili."""
-    data = {}
-    sources = []
-    for u in CANDIDATE_URLS:
-        url = u.format(ean=ean)
-        r = _http_get(url)
-        if not r:
-            continue
-        txt = r.text
-        if str(ean) not in txt:
-            continue
-
-        # prova a prendere un titolo plausibile di prodotto
-        m = re.search(r"<h1[^>]*>([^<]{10,200})</h1>", txt, re.I|re.S)
-        title = _clean_text(m.group(1)) if m else ""
-        if not title:
-            # fallback su <title>
-            m2 = re.search(r"<title>([^<]{10,200})</title>", txt, re.I|re.S)
-            title = _clean_text(m2.group(1)) if m2 else ""
-
-        if title:
-            data.setdefault("name", title)
-            data.setdefault("quantity", _pick_qty(title))
-            data.setdefault("form", _pick_form(title))
-
-        # brand grezzo (da breadcrumb/meta)
-        m3 = re.search(r'(?:Brand|Marca)\s*[:\-]\s*([A-Za-z0-9 \-\’\']{2,40})', txt, re.I)
-        if m3:
-            data.setdefault("brand", _clean_text(m3.group(1)))
-
-        # ingredienti
-        m4 = re.search(r"(?:INGREDIENTI|INCI|Ingredients)\s*[:\-]?\s*</?\w*>\s*([^<]{10,800})", txt, re.I)
-        if m4:
-            data.setdefault("ingredients", _clean_text(m4.group(1)))
-
-        sources.append(url)
-        if len(sources) >= limit_pages:
+def ddg_search_urls(query: str, max_links=8):
+    base = "https://duckduckgo.com/html/"
+    q = {"q": query}
+    r = _http_get(base + "?" + urllib.parse.urlencode(q), timeout=10)
+    if not r: return []
+    html_text = r.text
+    links = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html_text, re.I)
+    cleaned = []
+    for href in links:
+        href = html.unescape(href)
+        if href.startswith("http"):
+            cleaned.append(href)
+        if len(cleaned) >= max_links:
             break
+    return cleaned
+
+def fetch_from_web_search(ean: str, max_pages=10):
+    variants = normalize_ean_variants(ean)
+    queries = []
+    for v in variants:
+        queries += [f'"{v}"', f'EAN {v}', f'GTIN {v}']
+    seen = set(); queries = [q for q in queries if not (q in seen or seen.add(q))]
+    urls = []
+    for q in queries:
+        urls.extend(ddg_search_urls(q, max_links=6))
+        time.sleep(0.4)
+    for u in CANDIDATE_SEARCH_PAGES:
+        urls.append(u.format(ean=ean))
+    data, sources = {}, []
+    for url in urls[:max_pages]:
+        r = _http_get(url)
+        if not r: continue
+        txt = r.text
+        if not page_contains_any_ean(txt, variants):
+            continue
+        title, h1 = extract_title_and_h1(txt)
+        brand, ingred = extract_brand_and_ingredients(txt)
+        name_guess = _clean_text(h1 or title)
+        if name_guess:
+            data.setdefault("name", name_guess)
+            data.setdefault("quantity", _pick_qty(name_guess))
+            data.setdefault("form", _pick_form(name_guess))
+        if brand: data.setdefault("brand", brand)
+        if ingred: data.setdefault("ingredients", ingred)
+        sources.append(url)
+        if data.get("name") and data.get("brand"):
+            break
+    if "name" in data:
+        data["name"] = _dedupe_words(data["name"])
+    if not data.get("category") and data.get("form"):
+        data["category"] = "cosmetico" if data["form"] in ["olio","crema","gel","spray","lozione","shampoo","balsamo"] else ""
     return data, sources
 
 def fetch_product_seed_by_ean(ean: str):
-    combined = {}
-    srcs = []
-
+    combined, srcs = {}, []
     d1, s1 = fetch_from_open_dbs(ean)
     if d1:
-        combined.update({k:v for k,v in d1.items() if v})
+        combined.update({k: v for k, v in d1.items() if v})
         srcs.extend(s1)
-
-    # se mancano ancora nome/brand, prova HTML
     if not (combined.get("name") and combined.get("brand")):
-        d2, s2 = fetch_from_html(ean)
+        d2, s2 = fetch_from_web_search(ean, max_pages=12)
         if d2:
-            # non sovrascrivere campi già buoni
             for k, v in d2.items():
                 combined.setdefault(k, v)
             srcs.extend(s2)
-
-    # normalizzazioni
-    if "name" in combined:
-        combined["name"] = _dedupe_words(combined["name"])
-    if not combined.get("category") and combined.get("form"):
-        combined["category"] = "cosmetico" if combined["form"] in ["olio","crema","gel","spray","lozione","shampoo","balsamo"] else ""
-
     return combined, srcs
 
 # ---------- LLM call ----------
@@ -280,7 +315,6 @@ def call_llm(ean: str, user_prompt: str, tone: str, lang: str, include_bullets: 
         meta="7) Meta description (max 160 caratteri)." if include_meta else "",
         base_fields=BASE_FIELDS,
     )
-
     try:
         resp = client.chat.completions.create(
             model=MODEL,
@@ -333,7 +367,7 @@ if submitted:
         with st.spinner("Cerco dati pubblici dal codice EAN..."):
             seed, sources = fetch_product_seed_by_ean(ean)
 
-    # costruisci prompt effettivo
+    # costruisci il prompt effettivo per l'LLM
     auto_prompt = ""
     if seed:
         parts = []
@@ -343,7 +377,6 @@ if submitted:
         if seed.get("form"):     parts.append(f"Forma: {seed['form']}.")
         if seed.get("quantity"): parts.append(f"Quantità: {seed['quantity']}.")
         if seed.get("ingredients"):
-            # accorcia ingredienti lunghissimi
             ingred = seed["ingredients"]
             if len(ingred) > 800:
                 ingred = ingred[:800] + "..."
@@ -354,7 +387,7 @@ if submitted:
 
     if not effective_user_prompt:
         st.info("Non ho trovato informazioni online per questo EAN. "
-                "La risposta mostrerà solo 'Dati mancanti' (nessun segnaposto).")
+                "La risposta mostrerà solo 'Dati mancanti'.")
 
     result = call_llm(ean, effective_user_prompt, tone, lang, include_bullets, include_meta)
 

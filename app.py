@@ -27,9 +27,11 @@ class MedipimAPI:
         self.debug = debug
         self.last_debug = []
         if cookie_header:
+            # Allow user to paste a Cookie header to reuse an authenticated session
             self.session.headers["Cookie"] = cookie_header
             self.last_debug.append("Injected Cookie header for session reuse")
 
+    # --- helpers ---
     def _abs(self, href: str) -> str:
         return urljoin(self.base_url, href)
 
@@ -40,74 +42,219 @@ class MedipimAPI:
         resp.raise_for_status()
         return resp
 
-    def _post(self, url: str, data: dict, **kwargs):
+    def _post(self, url: str, data: dict = None, json: dict = None, **kwargs):
         headers = kwargs.pop("headers", {})
-        headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        if json is None:
+            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
         headers.setdefault("Referer", url)
-        resp = self.session.post(url, data=data, allow_redirects=True, timeout=30, headers=headers, **kwargs)
+        resp = self.session.post(url, data=data, json=json, allow_redirects=True, timeout=30, headers=headers, **kwargs)
         if self.debug:
-            self.last_debug.append(f"POST {url} -> {resp.status_code} | final: {resp.url} | sent keys: {list(data.keys())}")
+            sent_keys = list((data or json or {}).keys())
+            self.last_debug.append(f"POST {url} -> {resp.status_code} | final: {resp.url} | sent keys: {sent_keys}")
         resp.raise_for_status()
         return resp
 
+    def _find_login_form(self, html: str):
+        soup = BeautifulSoup(html, "lxml")
+        form = soup.find("form", attrs={"id": re.compile(r"login|signin", re.I)}) or \
+               soup.find("form", attrs={"action": re.compile(r"login", re.I)}) or \
+               soup.find("form")
+        action = None
+        inputs = {}
+        if form:
+            action = form.get("action")
+            for i in form.select("input[name]"):
+                inputs[i.get("name")] = i.get("value", "")
+        # also scrape meta csrf tokens
+        meta_token = soup.find("meta", attrs={"name": re.compile(r"csrf", re.I)})
+        if meta_token and meta_token.get("content"):
+            inputs.setdefault("_csrf_token", meta_token["content"])  # common name
+        # fallback: collect inputs from entire page if no form
+        if not inputs:
+            for i in soup.select("input[name]"):
+                inputs[i.get("name")] = i.get("value", "")
+        return action, inputs
+
+    # --- auth ---
     def login(self) -> bool:
+        """Try API login first, then HTML form fallbacks. Store helpful debug steps."""
         self.last_debug.clear()
         login_url = self._abs("login")
         try:
-            resp = self._get(login_url)
+            self._get(login_url)
         except Exception as e:
             self.last_debug.append(f"Failed to GET login page: {e}")
-            return False
 
-        # Try a direct API login endpoint (common in Medipim)
-        api_login_url = self._abs("api/login_check")
+        # 1) Try JSON API login endpoints commonly used by Symfony stacks
+        api_candidates = [
+            (self._abs("api/login_check"), {"username": self.username, "password": self.password}),
+            (self._abs("login_check"), {"_username": self.username, "_password": self.password}),
+            (self._abs("en/login_check"), {"_username": self.username, "_password": self.password}),
+            (self._abs("authenticate"), {"username": self.username, "password": self.password}),
+        ]
+        for url, payload in api_candidates:
+            try:
+                r = self._post(url, json=payload, headers={"Accept": "application/json"})
+                if r.status_code in (200, 204):
+                    self.logged_in = True
+                    return True
+            except Exception as e:
+                self.last_debug.append(f"API login attempt to {url} failed: {e}")
+
+        # 2) Try HTML form login (handles CSRF)
         try:
-            r = self.session.post(api_login_url, json={"username": self.username, "password": self.password}, headers={"Accept": "application/json"}, timeout=30)
-            if r.status_code in (200, 204):
-                self.logged_in = True
-                return True
+            resp = self._get(login_url)
+            action, inputs = self._find_login_form(resp.text)
+            action_url = self._abs(action) if action else login_url
+            # discover likely keys
+            discovered = inputs.copy()
+            uname_key = next((k for k in discovered.keys() if k.lower() in {"_username", "username", "email", "_email", "login"}), "_username")
+            pwd_key = next((k for k in discovered.keys() if k.lower() in {"_password", "password", "pass", "passwd"}), "_password")
+            discovered[uname_key] = self.username
+            discovered[pwd_key] = self.password
+            # Pass CSRF both in body and header if we saw it
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            if discovered.get("_csrf_token"):
+                headers["X-CSRF-TOKEN"] = discovered["_csrf_token"]
+            post_resp = self._post(action_url, data=discovered, headers=headers)
+            # probe an authenticated page
+            for probe_path in ("home", "products", "account", "profile"):
+                try:
+                    probe = self._get(self._abs(probe_path))
+                    if any(token in probe.text for token in ["Logout", "Sign out", "My account", "Products", "Dashboard"]):
+                        self.logged_in = True
+                        return True
+                except Exception:
+                    continue
         except Exception as e:
-            self.last_debug.append(f"API login attempt failed: {e}")
+            self.last_debug.append(f"Form login failed: {e}")
 
         self.logged_in = False
         return False
 
-    def search_product(self, product_id: str) -> str | None:
+    # --- product search ---
+    def search_product(self, product_id: str, search_hint: str | None = None) -> str | None:
+        """Return a product detail URL for a given ID.
+        search_hint can be one of: refcode, ean, gtin, sku, id
+        """
         if not self.logged_in and not self.login():
             return None
 
-        # Use the API search endpoint if available
+        # If the user pasted a URL, accept it directly
+        if isinstance(product_id, str) and product_id.startswith("http"):
+            return product_id
+
+        # 0) API search (JSON), if available
         try:
+            # try generic search param
             api_url = self._abs(f"api/products?search={product_id}")
             resp = self._get(api_url, headers={"Accept": "application/json"})
             data = resp.json()
-            if isinstance(data, dict) and "items" in data and data["items"]:
-                # assume first product
+            if isinstance(data, dict) and data.get("items"):
                 detail_id = data["items"][0].get("id")
                 if detail_id:
                     return self._abs(f"en/product/{detail_id}")
         except Exception as e:
             self.last_debug.append(f"API search failed: {e}")
 
+        # 1) HTML search: build candidates (encoded and raw bracket forms)
+        fields = [search_hint] if search_hint else ["refcode", "ean", "gtin", "sku", "id"]
+        candidates = []
+        for field in fields:
+            candidates.append(f"products?search%5B{field}%5D={product_id}")
+            candidates.append(f"products?search={field}%5B{product_id}%5D")
+            candidates.append(f"products?search={product_id}")
+        direct_candidates = [
+            f"en/products/{product_id}", f"en/product/{product_id}", f"products/{product_id}", f"product/{product_id}"
+        ]
+
+        # 2) Try search result pages and extract first product link
+        for path in candidates:
+            try:
+                resp = self._get(self._abs(path))
+            except Exception:
+                continue
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            links = soup.select('a[href*="/en/product"], a[href*="/product?id="], a[href*="/products/"]')
+            for a in links:
+                href = a.get("href") or ""
+                if href:
+                    return self._abs(href)
+
+            # SSR shell hint
+            card = soup.find(attrs={"data-product-id": True})
+            if card and card.get("href"):
+                return self._abs(card.get("href"))
+
+        # 3) Guess direct detail URLs
+        for path in direct_candidates:
+            try:
+                resp = self._get(self._abs(path))
+                if any(k in resp.text for k in ["Media", "Specifications", "Images", "Downloads", "Product"]):
+                    return resp.url
+            except Exception:
+                continue
+
         return None
 
+    # --- media lookup ---
     def get_image_url(self, product_detail_url: str, prefer_size: str = "1500x1500") -> str | None:
         if not self.logged_in and not self.login():
             return None
+
+        # API media endpoint first
         try:
-            # Use API media endpoint if possible
             product_id = product_detail_url.rstrip("/").split("/")[-1]
             media_url = self._abs(f"api/products/{product_id}/media")
             resp = self._get(media_url, headers={"Accept": "application/json"})
             data = resp.json()
             if isinstance(data, list) and data:
+                # Prefer huge/large
                 for item in data:
-                    if "huge" in item.get("url", "") or "large" in item.get("url", ""):
-                        return item["url"]
+                    url = item.get("url", "")
+                    if "/media/huge/" in url or "/media/large/" in url:
+                        return url
+                # else return first
+                return data[0].get("url")
         except Exception as e:
             self.last_debug.append(f"API media fetch failed: {e}")
+
+        # HTML fallback: open product page and (if needed) media tab
+        try:
+            resp = self._get(product_detail_url)
+            soup = BeautifulSoup(resp.text, "lxml")
+            media_link = soup.find('a', href=lambda h: h and 'media' in h.lower())
+            page_html = resp.text
+            if media_link and media_link.get("href"):
+                media_url = self._abs(media_link["href"])
+                mresp = self._get(media_url)
+                page_html = mresp.text
+                soup = BeautifulSoup(page_html, "lxml")
+
+            a_candidates = soup.select('a[href*="/media/huge/"], a[href*="/media/large/"]')
+            if a_candidates:
+                href = a_candidates[0]["href"]
+                return self._abs(href) if href.startswith("/") else href
+
+            for img in soup.find_all("img"):
+                for attr in ("data-src", "src"):
+                    val = img.get(attr)
+                    if val and ("/media/huge/" in val or "/media/large/" in val):
+                        return self._abs(val) if val.startswith("/") else val
+
+            huge = re.findall(r"https?://[^\"]+/media/huge/[a-f0-9]+\.jpe?g", page_html)
+            if huge:
+                return huge[0]
+            large = re.findall(r"https?://[^\"]+/media/large/[a-f0-9]+\.jpe?g", page_html)
+            if large:
+                return large[0]
+        except Exception as e:
+            self.last_debug.append(f"HTML media parse failed: {e}")
+
         return None
 
+    # --- download ---
     def download_image(self, image_url: str, save_path: str) -> bool:
         if not self.logged_in and not self.login():
             return False
@@ -132,12 +279,14 @@ st.set_page_config(page_title="Medipim Image Downloader", page_icon="📸", layo
 st.title("📸 Medipim Image Downloader")
 st.markdown("Upload a list of product IDs and download 1500x1500 images as a ZIP file.")
 
+# Sidebar (credentials)
 st.sidebar.header("Medipim Credentials")
 username = st.sidebar.text_input("Username", value="", placeholder="name.surname@redcare-pharmacy.com")
 password = st.sidebar.text_input("Password", type="password", value="")
 base_url = st.sidebar.text_input("Base URL", value="https://platform.medipim.be/en/")
 show_debug = st.sidebar.toggle("Show login debug", value=False)
 cookie_header_opt = st.sidebar.text_input("Cookie header (optional)", value="", placeholder="PHPSESSID=...; other=...")
+search_hint = st.sidebar.selectbox("Search field (hint)", ["auto", "refcode", "ean", "gtin", "sku", "id"], index=0)
 
 with st.sidebar:
     if st.button("🔐 Test Login", use_container_width=True, disabled=not username or not password):
@@ -148,8 +297,10 @@ with st.sidebar:
         else:
             st.error("Login failed ❌. Check credentials or try again later.")
             if api.last_debug:
-                st.code("\n".join(api.last_debug)[-4000:], language="text")
+                st.code("
+".join(api.last_debug)[-4000:], language="text")
 
+# Main content
 col1, col2 = st.columns([1, 1])
 
 with col1:
@@ -162,7 +313,7 @@ with col1:
             df = pd.read_csv(uploaded)
         except Exception:
             uploaded.seek(0)
-            df = pd.read_csv(uploaded, sep=";")
+            df = pd.read_csv(uploaded, sep=";")  # fallback to semicolon
         st.write("Preview:")
         st.dataframe(df.head())
         if len(df.columns) > 1:
@@ -171,16 +322,18 @@ with col1:
         else:
             product_ids = df.iloc[:, 0].dropna().astype(str).str.strip().tolist()
     else:
-        st.markdown("**Or paste product IDs manually:**")
-        manual = st.text_area("Product IDs (one per line)", placeholder="4811337\n4811338\n4811339", height=150)
+        st.markdown("**Or paste product IDs / product URLs manually:**")
+        manual = st.text_area("Product IDs or product URLs (one per line)", placeholder="4811337
+https://platform.medipim.be/en/product/12345
+4811339", height=150)
         if manual:
             product_ids = [x.strip() for x in manual.splitlines() if x.strip()]
 
 with col2:
     st.header("⚙️ Download Settings")
     if product_ids:
-        st.success(f"Found {len(product_ids)} product IDs")
-        st.write("IDs to process (showing up to 10):")
+        st.success(f"Found {len(product_ids)} product IDs/URLs")
+        st.write("Items to process (showing up to 10):")
         for pid in product_ids[:10]:
             st.write(f"• {pid}")
         if len(product_ids) > 10:
@@ -192,7 +345,7 @@ with col2:
             st.error("Please enter username and password")
             st.stop()
         if not product_ids:
-            st.error("Please provide at least one product ID")
+            st.error("Please provide at least one product ID or URL")
             st.stop()
 
         progress = st.progress(0)
@@ -204,7 +357,8 @@ with col2:
         if not api.login():
             st.error("Login error. Verify credentials or try again later.")
             if show_debug and api.last_debug:
-                st.code("\n".join(api.last_debug)[-4000:], language="text")
+                st.code("
+".join(api.last_debug)[-4000:], language="text")
             st.stop()
         status.text("Login OK!")
 
@@ -215,9 +369,9 @@ with col2:
         total = len(product_ids)
         for i, pid in enumerate(product_ids, start=1):
             progress.progress(i / total)
-            status.text(f"Processing product {pid} ({i}/{total})")
+            status.text(f"Processing {pid} ({i}/{total})")
             try:
-                detail_url = api.search_product(str(pid))
+                detail_url = api.search_product(str(pid), search_hint=search_hint if search_hint != "auto" else None)
                 if not detail_url:
                     failed.append(f"{pid}: Product not found")
                     continue
@@ -227,7 +381,8 @@ with col2:
                     failed.append(f"{pid}: Image not found")
                     continue
 
-                save_path = os.path.join(temp_dir, f"{pid}.jpg")
+                # name file using original input token (pid)
+                save_path = os.path.join(temp_dir, f"{re.sub(r'[^A-Za-z0-9_-]+', '_', pid)}.jpg")
                 if api.download_image(img_url, save_path):
                     downloaded.append((pid, save_path))
                 else:
@@ -240,7 +395,7 @@ with col2:
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for pid, path in downloaded:
-                    zf.write(path, arcname=f"{pid}.jpg")
+                    zf.write(path, arcname=f"{re.sub(r'[^A-Za-z0-9_-]+', '_', pid)}.jpg")
             zip_buf.seek(0)
 
             with results:
@@ -252,10 +407,11 @@ with col2:
                 st.download_button(
                     label="📥 Download ZIP",
                     data=zip_buf.getvalue(),
-                    file_name=f"medipim_images_{len(downloaded)}_products.zip",
+                    file_name=f"medipim_images_{len(downloaded)}_items.zip",
                     mime="application/zip",
                 )
 
+            # cleanup
             for _, p in downloaded:
                 try:
                     os.remove(p)
@@ -274,8 +430,11 @@ with col2:
 
 st.markdown("---")
 st.markdown(
-    "**Notes:**\n\n"
-    "- Credentials are never stored.\n"
-    "- Use **🔐 Test Login** in the sidebar to troubleshoot authentication.\n"
-    "- You can change **Base URL** if Medipim uses a different locale (e.g., /nl/)."
+    """**Notes:**
+
+- Credentials are never stored.
+- Use **🔐 Test Login** in the sidebar to troubleshoot authentication.
+- You can change **Base URL** if Medipim uses a different locale (e.g., /nl/).
+- If search can't find your product by ID, paste a direct product URL from Medipim.
+"""
 )

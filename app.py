@@ -56,6 +56,7 @@ with col1:
 
 with col2:
     st.header("⚙️ Configurazione Download")
+    debug_mode = st.checkbox("Mostra log di debug")
     
     if product_ids:
         st.success(f"Trovati {len(product_ids)} ID prodotto")
@@ -124,6 +125,8 @@ with col2:
             
             # Create ZIP file
             if downloaded_images:
+                if debug_mode:
+                    st.info('Debug: immagini trovate per i seguenti ID: ' + ', '.join([pid for pid, _ in downloaded_images]))
                 status_text.text("Creando file ZIP...")
                 zip_buffer = io.BytesIO()
                 
@@ -139,6 +142,8 @@ with col2:
                     
                     if failed_downloads:
                         st.warning(f"⚠️ {len(failed_downloads)} download falliti:")
+                        if debug_mode:
+                            st.code('\n'.join(failed_downloads))
                         for failure in failed_downloads:
                             st.write(f"• {failure}")
                     
@@ -169,3 +174,5 @@ with col2:
 # Footer
 st.markdown("---")
 st.markdown("**Nota:** Assicurati di avere le credenziali corrette per accedere alla piattaforma Medipim.")
+
+

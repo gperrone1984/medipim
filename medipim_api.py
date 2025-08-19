@@ -6,27 +6,26 @@ import re
 class MedipimAPI:
     def __init__(self, username, password):
         self.session = requests.Session()
-        self.base_url = "https://platform.medipim.be/en/"  # keep EN locale; site may redirect if different
+        self.base_url = "https://platform.medipim.be/en/"  # URL base
         self.username = username
         self.password = password
         self.logged_in = False
 
     def login(self):
         login_url = self.base_url + "login"
-        # Basic browser-y headers help some auth flows
+        # Header tipo browser
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": login_url,
         })
-        # 1) GET login page (grab CSRF if present)
+        # GET login page per token
         resp_get = self.session.get(login_url, allow_redirects=True, timeout=30)
-        from bs4 import BeautifulSoup
         soup = BeautifulSoup(resp_get.content, 'html.parser')
         csrf_token_input = soup.find('input', {'name': '_csrf_token'})
         csrf_token = csrf_token_input['value'] if csrf_token_input else None
 
-        # 2) POST credentials (+ CSRF if present)
+        # POST credenziali
         data = {
             '_username': self.username,
             '_password': self.password,
@@ -36,10 +35,8 @@ class MedipimAPI:
 
         resp_post = self.session.post(login_url, data=data, allow_redirects=True, timeout=30)
 
-        # Helper: determine if logged in by checking for common authenticated markers
         def looks_logged_in(html, url):
             text = html.lower()
-            # Common markers when authenticated: logout links, user/profile menu, absence of login form
             has_logout = "logout" in text or "/logout" in text
             no_login_form = "_username" not in text and "_password" not in text
             left_login_page = "/login" not in url
@@ -49,7 +46,6 @@ class MedipimAPI:
             self.logged_in = True
             return True
 
-        # Some sites redirect to home after login; try fetching home to verify
         try:
             home_resp = self.session.get(self.base_url + "home", allow_redirects=True, timeout=30)
             if looks_logged_in(home_resp.text, home_resp.url):
@@ -58,7 +54,6 @@ class MedipimAPI:
         except Exception:
             pass
 
-        # As a final check, if we are not on the login page URL anymore, accept
         if resp_post.ok and "/login" not in resp_post.url:
             self.logged_in = True
             return True
@@ -67,92 +62,111 @@ class MedipimAPI:
         return False
 
     def search_product(self, product_id):
-        if not self.logged_in:
-            if not self.login():
-                return None
-        
-        search_url = self.base_url + f"products?search=refcode[{product_id}]"
-        response = self.session.get(search_url)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Find the link to the product details page
-        # Look for links that contain the product ID
-        product_links = soup.find_all('a', href=lambda href: href and '/en/product?id=' in href)
-        
-        for link in product_links:
-            # Check if the link text or nearby text contains our product ID
-            link_text = link.get_text()
-            if product_id in link_text:
-                return self.base_url.rstrip('/') + link['href']
-        
+        if not self.logged_in and not self.login():
+            return None
+
+        # Usa solo numero/lettere pure (toglie bullet, spazi, simboli)
+        clean_id = re.sub(r'[^0-9A-Za-z]', '', str(product_id))
+
+        search_patterns = [
+            f"products?search=refcode[{clean_id}]",
+            f"products?search={clean_id}",
+            f"products?search=ean[{clean_id}]",
+        ]
+
+        for pattern in search_patterns:
+            search_url = self.base_url + pattern
+            resp = self.session.get(search_url)
+            if resp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(resp.content, 'html.parser')
+            links = soup.find_all('a', href=lambda href: href and ('/en/product?id=' in href or '/en/product/' in href))
+            if links:
+                for link in links:
+                    context = (link.get_text() or "") + " " + (" ".join(link.parent.stripped_strings) if link.parent else "")
+                    # Confronto con numero puro
+                    if clean_id in re.sub(r'[^0-9A-Za-z]', '', context):
+                        href = link['href']
+                        if not href.startswith('http'):
+                            href = self.base_url.rstrip('/') + href
+                        return href
+                # fallback: primo link
+                href = links[0]['href']
+                if not href.startswith('http'):
+                    href = self.base_url.rstrip('/') + href
+                return href
+
         return None
 
     def get_image_url(self, product_detail_url, size="1500x1500"):
-        if not self.logged_in:
-            if not self.login():
-                return None
+        if not self.logged_in and not self.login():
+            return None
 
-        response = self.session.get(product_detail_url)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Navigate to media section
+        resp_detail = self.session.get(product_detail_url)
+        soup = BeautifulSoup(resp_detail.content, 'html.parser')
+
+        html = resp_detail.text
+        url_patterns = [
+            r"https://assets\.medipim\.be/media/huge/[a-f0-9]+\.(?:jpeg|jpg|png|webp)(?:\?[^\" \t<>]*)?",
+            r"https://assets\.medipim\.be/media/large/[a-f0-9]+\.(?:jpeg|jpg|png|webp)(?:\?[^\" \t<>]*)?",
+        ]
+        for pat in url_patterns:
+            m = re.search(pat, html)
+            if m:
+                return m.group(0)
+
         media_link = soup.find('a', href=lambda href: href and 'media' in href.lower())
         if not media_link:
-            # Try to find media tab or section
-            media_elements = soup.find_all(text=re.compile(r'Media', re.IGNORECASE))
+            media_elements = soup.find_all(string=re.compile(r'Media', re.IGNORECASE))
             for element in media_elements:
                 parent = element.parent
-                if parent.name == 'a' and parent.get('href'):
+                if parent and parent.name == 'a' and parent.get('href'):
                     media_link = parent
                     break
-        
-        if media_link:
-            media_href = media_link['href']
-            if not media_href.startswith('http'):
-                media_url = self.base_url.rstrip('/') + '/' + media_href.lstrip('/')
-            else:
-                media_url = media_href
-                
-            response = self.session.get(media_url)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Look for image URLs - try different patterns
-            # Pattern 1: Direct links to huge/large images
-            image_links = soup.find_all('a', href=lambda href: href and '/media/huge/' in href)
-            if not image_links:
-                image_links = soup.find_all('a', href=lambda href: href and '/media/large/' in href)
-            
-            if image_links:
-                return image_links[0]['href']
-            
-            # Pattern 2: Look for image URLs in the page content
-            page_text = response.text
-            huge_pattern = r'https://assets\.medipim\.be/media/huge/[a-f0-9]+\.jpeg'
-            large_pattern = r'https://assets\.medipim\.be/media/large/[a-f0-9]+\.jpeg'
-            
-            huge_matches = re.findall(huge_pattern, page_text)
-            if huge_matches:
-                return huge_matches[0]
-                
-            large_matches = re.findall(large_pattern, page_text)
-            if large_matches:
-                return large_matches[0]
-        
+
+        if not media_link:
+            candidate = product_detail_url.rstrip('/') + '/media'
+            resp_media = self.session.get(candidate)
+            if resp_media.ok:
+                text = resp_media.text
+                for pat in url_patterns:
+                    m = re.search(pat, text)
+                    if m:
+                        return m.group(0)
+        else:
+            href = media_link.get('href')
+            if not href:
+                return None
+            media_url = href if href.startswith('http') else self.base_url.rstrip('/') + '/' + href.lstrip('/')
+            resp_media = self.session.get(media_url)
+            if resp_media.ok:
+                text = resp_media.text
+                for pat in url_patterns:
+                    m = re.search(pat, text)
+                    if m:
+                        return m.group(0)
+
         return None
 
     def download_image(self, image_url, save_path):
-        if not self.logged_in:
-            if not self.login():
-                return False
-
+        if not self.logged_in and not self.login():
+            return (False, None, None)
         try:
-            response = self.session.get(image_url, stream=True)
-            if response.status_code == 200:
+            headers = {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": self.base_url,
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            }
+            response = self.session.get(image_url, stream=True, headers=headers, allow_redirects=True, timeout=60)
+            ctype = response.headers.get("Content-Type", "")
+            if response.status_code == 200 and ctype.startswith("image/"):
                 with open(save_path, 'wb') as f:
                     for chunk in response.iter_content(1024):
                         f.write(chunk)
-                return True
+                return (True, response.status_code, ctype)
+            else:
+                return (False, response.status_code, ctype)
         except Exception as e:
             print(f"Error downloading image: {e}")
-            
-        return False
+            return (False, None, None)

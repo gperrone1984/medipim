@@ -93,6 +93,7 @@ with col2:
             temp_dir = tempfile.mkdtemp()
             downloaded_images = []
             failed_downloads = []
+            results_log = []
             
             # Process each product ID
             for i, product_id in enumerate(product_ids):
@@ -105,20 +106,25 @@ with col2:
                     product_url = api.search_product(product_id)
                     if not product_url:
                         failed_downloads.append(f"{product_id}: Prodotto non trovato")
+                        results_log.append({"product_id": product_id, "status": "product_not_found", "product_url": None, "image_url": None, "http_status": None, "content_type": None})
                         continue
                     
                     # Get image URL
                     image_url = api.get_image_url(product_url)
                     if not image_url:
                         failed_downloads.append(f"{product_id}: Immagine non trovata")
+                        results_log.append({"product_id": product_id, "status": "image_not_found", "product_url": product_url, "image_url": None, "http_status": None, "content_type": None})
                         continue
                     
                     # Download image
                     image_path = os.path.join(temp_dir, f"{product_id}.jpg")
-                    if api.download_image(image_url, image_path):
+                    ok, http_status, content_type = api.download_image(image_url, image_path)
+                    if ok:
                         downloaded_images.append((product_id, image_path))
+                        results_log.append({"product_id": product_id, "status": "ok", "product_url": product_url, "image_url": image_url, "http_status": http_status, "content_type": content_type})
                     else:
-                        failed_downloads.append(f"{product_id}: Errore durante il download")
+                        failed_downloads.append(f"{product_id}: Errore durante il download (status={http_status}, type={content_type})")
+                        results_log.append({"product_id": product_id, "status": "download_error", "product_url": product_url, "image_url": image_url, "http_status": http_status, "content_type": content_type})
                         
                 except Exception as e:
                     failed_downloads.append(f"{product_id}: {str(e)}")
@@ -154,6 +160,14 @@ with col2:
                         file_name=f"medipim_images_{len(downloaded_images)}_products.zip",
                         mime="application/zip"
                     )
+                    
+                    if debug_mode:
+                        import pandas as pd
+                        df_results = pd.DataFrame(results_log)
+                        st.subheader('Dettagli debug per ID prodotto')
+                        st.dataframe(df_results)
+                        csv = df_results.to_csv(index=False).encode('utf-8')
+                        st.download_button('📄 Scarica log CSV', data=csv, file_name='medipim_debug_log.csv', mime='text/csv')
                 
                 # Cleanup
                 for _, image_path in downloaded_images:

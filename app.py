@@ -13,7 +13,7 @@ from urllib.parse import urljoin
 # MedipimAPI (embedded)
 # ================================
 class MedipimAPI:
-    def __init__(self, username: str, password: str, base_url: str = "https://platform.medipim.be/en/", debug: bool = False):
+    def __init__(self, username: str, password: str, base_url: str = "https://platform.medipim.be/en/", debug: bool = False, cookie_header: str | None = None):
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
@@ -26,6 +26,10 @@ class MedipimAPI:
         self.logged_in = False
         self.debug = debug
         self.last_debug = []
+        if cookie_header:
+            # Allow user to paste a Cookie header to reuse an authenticated session
+            self.session.headers["Cookie"] = cookie_header
+            self.last_debug.append("Injected Cookie header for session reuse")
 
     def _abs(self, href: str) -> str:
         return urljoin(self.base_url, href)
@@ -58,6 +62,11 @@ class MedipimAPI:
             action = form.get("action")
             for i in form.select("input[name]"):
                 inputs[i.get("name")] = i.get("value", "")
+        # also scrape meta csrf tokens
+        meta_token = soup.find("meta", attrs={"name": re.compile(r"csrf", re.I)})
+        if meta_token and meta_token.get("content"):
+            inputs.setdefault("_csrf_token", meta_token["content"])  # common name
+        # fallback: collect inputs from entire page if no form
         if not inputs:
             for i in soup.select("input[name]"):
                 inputs[i.get("name")] = i.get("value", "")
@@ -75,26 +84,41 @@ class MedipimAPI:
         action, inputs = self._find_login_form(resp.text)
         action_url = self._abs(action) if action else login_url
 
+        # try to derive a CSRF token from inputs or cookies
+        csrf_token = inputs.get("_csrf_token") or inputs.get("csrf_token") or ""
+        for ck, cv in self.session.cookies.get_dict().items():
+            if re.search(r"csrf", ck, re.I) and not csrf_token:
+                csrf_token = cv
+        base_headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if csrf_token:
+            base_headers["X-CSRF-TOKEN"] = csrf_token
+
         candidates = []
         discovered = inputs.copy()
         uname_key = next((k for k in discovered.keys() if k.lower() in {"_username", "username", "email", "_email", "login"}), "_username")
         pwd_key = next((k for k in discovered.keys() if k.lower() in {"_password", "password", "pass", "passwd"}), "_password")
         discovered[uname_key] = self.username
         discovered[pwd_key] = self.password
-        candidates.append((action_url, discovered))
-        candidates.append((action_url, {"_username": self.username, "_password": self.password, **{k:v for k,v in inputs.items() if k.startswith("_") and k not in {"_username", "_password"}}}))
-        candidates.append((action_url, {"email": self.username, "password": self.password, **{k:v for k,v in inputs.items() if k not in {"email", "password"}}}))
-        candidates.append((action_url, {"username": self.username, "password": self.password, **{k:v for k,v in inputs.items() if k not in {"username", "password"}}}))
+        if csrf_token and "_csrf_token" not in discovered:
+            discovered["_csrf_token"] = csrf_token
+        candidates.append((action_url, discovered, base_headers))
+        candidates.append((self._abs("login_check"), {"_username": self.username, "_password": self.password, "_csrf_token": csrf_token}, base_headers))
+        candidates.append((self._abs("en/login_check"), {"_username": self.username, "_password": self.password, "_csrf_token": csrf_token}, base_headers))
+        candidates.append((self._abs("authenticate"), {"username": self.username, "password": self.password, "_csrf_token": csrf_token}, base_headers))
+        candidates.append((self._abs("api/login_check"), {"username": self.username, "password": self.password}, {"Accept": "application/json"}))
+        candidates.append((action_url, {"email": self.username, "password": self.password, **{k:v for k,v in inputs.items() if k not in {"email", "password"}}}, base_headers))
+        candidates.append((action_url, {"username": self.username, "password": self.password, **{k:v for k,v in inputs.items() if k not in {"username", "password"}}}, base_headers))
 
         success = False
-        for post_to, payload in candidates:
+        for post_to, payload, headers in candidates:
             try:
-                post_resp = self._post(post_to, data=payload)
+                post_resp = self._post(post_to, data=payload, headers=headers)
             except Exception as e:
                 self.last_debug.append(f"POST failed: {e}")
                 continue
 
             redirected_away = ("/login" not in post_resp.url)
+
             probe_ok = False
             for probe_path in ("home", "products", "account", "profile"):
                 try:
@@ -206,10 +230,11 @@ username = st.sidebar.text_input("Username", value="", placeholder="name.surname
 password = st.sidebar.text_input("Password", type="password", value="")
 base_url = st.sidebar.text_input("Base URL", value="https://platform.medipim.be/en/")
 show_debug = st.sidebar.toggle("Show login debug", value=False)
+cookie_header_opt = st.sidebar.text_input("Cookie header (optional)", value="", placeholder="PHPSESSID=...; other=...")
 
 with st.sidebar:
     if st.button("🔐 Test Login", use_container_width=True, disabled=not username or not password):
-        api = MedipimAPI(username, password, base_url=base_url, debug=True)
+        api = MedipimAPI(username, password, base_url=base_url, debug=True, cookie_header=cookie_header_opt or None)
         ok = api.login()
         if ok:
             st.success("Login successful ✅")
@@ -267,7 +292,7 @@ with col2:
         status = st.empty()
         results = st.container()
 
-        api = MedipimAPI(username, password, base_url=base_url, debug=show_debug)
+        api = MedipimAPI(username, password, base_url=base_url, debug=show_debug, cookie_header=cookie_header_opt or None)
         status.text("Logging in…")
         if not api.login():
             st.error("Login error. Verify credentials or try again later.")

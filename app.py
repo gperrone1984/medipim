@@ -83,7 +83,7 @@ with col2:
             # Login
             status_text.text("Effettuando login...")
             if not api.login():
-                st.error("Errore durante il login. Verifica le credenziali.")
+                st.error("Errore durante il login. Le credenziali potrebbero essere corrette ma la sessione non è stata autenticata. Riprova e, se persiste, aggiorna l'app. ")
                 st.stop()
             
             status_text.text("Login effettuato con successo!")
@@ -169,5 +169,3 @@ with col2:
 # Footer
 st.markdown("---")
 st.markdown("**Nota:** Assicurati di avere le credenziali corrette per accedere alla piattaforma Medipim.")
-
-

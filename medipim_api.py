@@ -1,3 +1,4 @@
+
 import requests
 from bs4 import BeautifulSoup
 import os
@@ -66,93 +67,40 @@ class MedipimAPI:
         self.logged_in = False
         return False
 
-    def search_product(self, product_id):
-        if not self.logged_in:
-            if not self.login():
-                return None
-        
-        search_url = self.base_url + f"products?search=refcode[{product_id}]"
-        response = self.session.get(search_url)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Find the link to the product details page
-        # Look for links that contain the product ID
-        product_links = soup.find_all('a', href=lambda href: href and '/en/product?id=' in href)
-        
-        for link in product_links:
-            # Check if the link text or nearby text contains our product ID
-            link_text = link.get_text()
-            if product_id in link_text:
-                return self.base_url.rstrip('/') + link['href']
-        
-        return None
-
-    def get_image_url(self, product_detail_url, size="1500x1500"):
+        def search_product(self, product_id):
         if not self.logged_in:
             if not self.login():
                 return None
 
-        response = self.session.get(product_detail_url)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Navigate to media section
-        media_link = soup.find('a', href=lambda href: href and 'media' in href.lower())
-        if not media_link:
-            # Try to find media tab or section
-            media_elements = soup.find_all(text=re.compile(r'Media', re.IGNORECASE))
-            for element in media_elements:
-                parent = element.parent
-                if parent.name == 'a' and parent.get('href'):
-                    media_link = parent
-                    break
-        
-        if media_link:
-            media_href = media_link['href']
-            if not media_href.startswith('http'):
-                media_url = self.base_url.rstrip('/') + '/' + media_href.lstrip('/')
-            else:
-                media_url = media_href
-                
-            response = self.session.get(media_url)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Look for image URLs - try different patterns
-            # Pattern 1: Direct links to huge/large images
-            image_links = soup.find_all('a', href=lambda href: href and '/media/huge/' in href)
-            if not image_links:
-                image_links = soup.find_all('a', href=lambda href: href and '/media/large/' in href)
-            
-            if image_links:
-                return image_links[0]['href']
-            
-            # Pattern 2: Look for image URLs in the page content
-            page_text = response.text
-            huge_pattern = r'https://assets\.medipim\.be/media/huge/[a-f0-9]+\.jpeg'
-            large_pattern = r'https://assets\.medipim\.be/media/large/[a-f0-9]+\.jpeg'
-            
-            huge_matches = re.findall(huge_pattern, page_text)
-            if huge_matches:
-                return huge_matches[0]
-                
-            large_matches = re.findall(large_pattern, page_text)
-            if large_matches:
-                return large_matches[0]
-        
+        # Try several search patterns Medipim might accept
+        search_patterns = [
+            f"products?search=refcode[{product_id}]",
+            f"products?search={product_id}",
+            f"products?search=ean[{product_id}]",
+        ]
+
+        for pattern in search_patterns:
+            search_url = self.base_url + pattern
+            resp = self.session.get(search_url)
+            if resp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(resp.content, 'html.parser')
+
+            # Accept any product link; path might be /en/product?id=... or /en/product/slug
+            links = soup.find_all('a', href=lambda href: href and ('/en/product?id=' in href or '/en/product/' in href))
+            if links:
+                # Prefer links whose text or nearby text contains the product_id
+                for link in links:
+                    context = (link.get_text() or "") + " " + (" ".join(link.parent.stripped_strings) if link.parent else "")
+                    if str(product_id) in context:
+                        href = link['href']
+                        if not href.startswith('http'):
+                            href = self.base_url.rstrip('/') + href
+                        return href
+                # Fallback: first product link
+                href = links[0]['href']
+                if not href.startswith('http'):
+                    href = self.base_url.rstrip('/') + href
+                return href
         return None
-
-    def download_image(self, image_url, save_path):
-        if not self.logged_in:
-            if not self.login():
-                return False
-
-        try:
-            response = self.session.get(image_url, stream=True)
-            if response.status_code == 200:
-                with open(save_path, 'wb') as f:
-                    for chunk in response.iter_content(1024):
-                        f.write(chunk)
-                return True
-        except Exception as e:
-            print(f"Error downloading image: {e}")
-            
-        return False

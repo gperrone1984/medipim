@@ -27,7 +27,6 @@ class MedipimAPI:
         self.debug = debug
         self.last_debug = []
         if cookie_header:
-            # Allow user to paste a Cookie header to reuse an authenticated session
             self.session.headers["Cookie"] = cookie_header
             self.last_debug.append("Injected Cookie header for session reuse")
 
@@ -51,27 +50,6 @@ class MedipimAPI:
         resp.raise_for_status()
         return resp
 
-    def _find_login_form(self, html: str):
-        soup = BeautifulSoup(html, "lxml")
-        form = soup.find("form", attrs={"id": re.compile(r"login|signin", re.I)}) or \
-               soup.find("form", attrs={"action": re.compile(r"login", re.I)}) or \
-               soup.find("form")
-        action = None
-        inputs = {}
-        if form:
-            action = form.get("action")
-            for i in form.select("input[name]"):
-                inputs[i.get("name")] = i.get("value", "")
-        # also scrape meta csrf tokens
-        meta_token = soup.find("meta", attrs={"name": re.compile(r"csrf", re.I)})
-        if meta_token and meta_token.get("content"):
-            inputs.setdefault("_csrf_token", meta_token["content"])  # common name
-        # fallback: collect inputs from entire page if no form
-        if not inputs:
-            for i in soup.select("input[name]"):
-                inputs[i.get("name")] = i.get("value", "")
-        return action, inputs
-
     def login(self) -> bool:
         self.last_debug.clear()
         login_url = self._abs("login")
@@ -81,124 +59,53 @@ class MedipimAPI:
             self.last_debug.append(f"Failed to GET login page: {e}")
             return False
 
-        action, inputs = self._find_login_form(resp.text)
-        action_url = self._abs(action) if action else login_url
+        # Try a direct API login endpoint (common in Medipim)
+        api_login_url = self._abs("api/login_check")
+        try:
+            r = self.session.post(api_login_url, json={"username": self.username, "password": self.password}, headers={"Accept": "application/json"}, timeout=30)
+            if r.status_code in (200, 204):
+                self.logged_in = True
+                return True
+        except Exception as e:
+            self.last_debug.append(f"API login attempt failed: {e}")
 
-        # try to derive a CSRF token from inputs or cookies
-        csrf_token = inputs.get("_csrf_token") or inputs.get("csrf_token") or ""
-        for ck, cv in self.session.cookies.get_dict().items():
-            if re.search(r"csrf", ck, re.I) and not csrf_token:
-                csrf_token = cv
-        base_headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        if csrf_token:
-            base_headers["X-CSRF-TOKEN"] = csrf_token
-
-        candidates = []
-        discovered = inputs.copy()
-        uname_key = next((k for k in discovered.keys() if k.lower() in {"_username", "username", "email", "_email", "login"}), "_username")
-        pwd_key = next((k for k in discovered.keys() if k.lower() in {"_password", "password", "pass", "passwd"}), "_password")
-        discovered[uname_key] = self.username
-        discovered[pwd_key] = self.password
-        if csrf_token and "_csrf_token" not in discovered:
-            discovered["_csrf_token"] = csrf_token
-        candidates.append((action_url, discovered, base_headers))
-        candidates.append((self._abs("login_check"), {"_username": self.username, "_password": self.password, "_csrf_token": csrf_token}, base_headers))
-        candidates.append((self._abs("en/login_check"), {"_username": self.username, "_password": self.password, "_csrf_token": csrf_token}, base_headers))
-        candidates.append((self._abs("authenticate"), {"username": self.username, "password": self.password, "_csrf_token": csrf_token}, base_headers))
-        candidates.append((self._abs("api/login_check"), {"username": self.username, "password": self.password}, {"Accept": "application/json"}))
-        candidates.append((action_url, {"email": self.username, "password": self.password, **{k:v for k,v in inputs.items() if k not in {"email", "password"}}}, base_headers))
-        candidates.append((action_url, {"username": self.username, "password": self.password, **{k:v for k,v in inputs.items() if k not in {"username", "password"}}}, base_headers))
-
-        success = False
-        for post_to, payload, headers in candidates:
-            try:
-                post_resp = self._post(post_to, data=payload, headers=headers)
-            except Exception as e:
-                self.last_debug.append(f"POST failed: {e}")
-                continue
-
-            redirected_away = ("/login" not in post_resp.url)
-
-            probe_ok = False
-            for probe_path in ("home", "products", "account", "profile"):
-                try:
-                    probe = self._get(self._abs(probe_path))
-                    if any(token in probe.text for token in ["Logout", "Sign out", "My account", "Products", "Dashboard"]):
-                        probe_ok = True
-                        break
-                except Exception:
-                    continue
-
-            if redirected_away or probe_ok:
-                success = True
-                break
-
-        self.logged_in = success
-        return self.logged_in
+        self.logged_in = False
+        return False
 
     def search_product(self, product_id: str) -> str | None:
         if not self.logged_in and not self.login():
             return None
 
-        candidates = [
-            f"products?search=refcode%5B{product_id}%5D",
-            f"products?search=refcode[{product_id}]",
-            f"products?search={product_id}",
-        ]
+        # Use the API search endpoint if available
+        try:
+            api_url = self._abs(f"api/products?search={product_id}")
+            resp = self._get(api_url, headers={"Accept": "application/json"})
+            data = resp.json()
+            if isinstance(data, dict) and "items" in data and data["items"]:
+                # assume first product
+                detail_id = data["items"][0].get("id")
+                if detail_id:
+                    return self._abs(f"en/product/{detail_id}")
+        except Exception as e:
+            self.last_debug.append(f"API search failed: {e}")
 
-        for path in candidates:
-            try:
-                resp = self._get(self._abs(path))
-            except Exception:
-                continue
-
-            soup = BeautifulSoup(resp.text, "lxml")
-            links = soup.select('a[href*="/en/product"], a[href*="/product?id="], a[href*="/products/"]')
-            for a in links:
-                href = a.get("href") or ""
-                text = (a.get_text(strip=True) or "")
-                if product_id in text or True:
-                    return self._abs(href)
         return None
 
     def get_image_url(self, product_detail_url: str, prefer_size: str = "1500x1500") -> str | None:
         if not self.logged_in and not self.login():
             return None
-
-        resp = self._get(product_detail_url)
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        media_link = soup.find('a', href=lambda h: h and 'media' in h.lower())
-        if not media_link:
-            for el in soup.find_all(string=re.compile(r"Media", re.I)):
-                if el and el.parent and el.parent.name == "a" and el.parent.get("href"):
-                    media_link = el.parent
-                    break
-
-        page_html = resp.text
-        if media_link and media_link.get("href"):
-            media_url = self._abs(media_link["href"])
-            media_resp = self._get(media_url)
-            page_html = media_resp.text
-            soup = BeautifulSoup(page_html, "lxml")
-
-        a_candidates = soup.select('a[href*="/media/huge/"], a[href*="/media/large/"]')
-        if a_candidates:
-            href = a_candidates[0]["href"]
-            return self._abs(href) if href.startswith("/") else href
-
-        for img in soup.find_all("img"):
-            for attr in ("data-src", "src"):
-                val = img.get(attr)
-                if val and ("/media/huge/" in val or "/media/large/" in val):
-                    return self._abs(val) if val.startswith("/") else val
-
-        huge = re.findall(r"https?://[^\"]+/media/huge/[a-f0-9]+\.jpe?g", page_html)
-        if huge:
-            return huge[0]
-        large = re.findall(r"https?://[^\"]+/media/large/[a-f0-9]+\.jpe?g", page_html)
-        if large:
-            return large[0]
+        try:
+            # Use API media endpoint if possible
+            product_id = product_detail_url.rstrip("/").split("/")[-1]
+            media_url = self._abs(f"api/products/{product_id}/media")
+            resp = self._get(media_url, headers={"Accept": "application/json"})
+            data = resp.json()
+            if isinstance(data, list) and data:
+                for item in data:
+                    if "huge" in item.get("url", "") or "large" in item.get("url", ""):
+                        return item["url"]
+        except Exception as e:
+            self.last_debug.append(f"API media fetch failed: {e}")
         return None
 
     def download_image(self, image_url: str, save_path: str) -> bool:

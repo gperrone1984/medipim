@@ -19,9 +19,13 @@ from selenium.webdriver.support import expected_conditions as EC
 st.set_page_config(page_title="Medipim Export (NL+FR)", page_icon="📦", layout="centered")
 st.title("Medipim Export (NL + FR)")
 
-# ============================
-# UI
-# ============================
+# ---------------- Session state ----------------
+if "exports" not in st.session_state:
+    st.session_state["exports"] = {}    # {"nl": bytes, "fr": bytes}
+if "last_refs" not in st.session_state:
+    st.session_state["last_refs"] = ""
+
+# ---------------- UI ----------------
 with st.form("login_form", clear_on_submit=False):
     st.subheader("Login")
     email = st.text_input("Email", value="", autocomplete="username")
@@ -38,9 +42,7 @@ with st.form("login_form", clear_on_submit=False):
 
     submitted = st.form_submit_button("Run NL + FR export")
 
-# ============================
-# Driver factory (robust for Streamlit Cloud)
-# ============================
+# ---------------- Driver factory (robust for Streamlit Cloud) ----------------
 def make_ctx(download_dir: str):
     """Create a headless Chrome session with robust flags and a system fallback."""
     import os, tempfile
@@ -52,7 +54,6 @@ def make_ctx(download_dir: str):
 
     def build_options():
         opt = webdriver.ChromeOptions()
-        # Robust flags for cloud/headless
         opt.add_argument("--headless=new")
         opt.add_argument("--no-sandbox")
         opt.add_argument("--disable-dev-shm-usage")
@@ -61,7 +62,6 @@ def make_ctx(download_dir: str):
         opt.add_argument("--window-size=1440,1000")
         opt.add_argument("--remote-debugging-port=0")
         opt.add_argument(f"--user-data-dir={user_dir}")
-
         opt.add_experimental_option("prefs", {
             "download.default_directory": download_dir,
             "download.prompt_for_download": False,
@@ -71,16 +71,13 @@ def make_ctx(download_dir: str):
             "safebrowsing.disable_download_protection": True,
             "profile.default_content_setting_values.automatic_downloads": 1,
         })
-        # Enable performance logs (CDP fallback for downloads)
         opt.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
         return opt
 
-    # Attempt A: Selenium Manager (Chrome for Testing + driver)
     opt = build_options()
     try:
-        driver = webdriver.Chrome(options=opt)
+        driver = webdriver.Chrome(options=opt)  # Selenium Manager
     except WebDriverException as e_a:
-        # Attempt B: System Chromium fallback (if packages.txt is used)
         chromebin = "/usr/bin/chromium"
         chromedrv = "/usr/bin/chromedriver"
         if os.path.exists(chromebin) and os.path.exists(chromedrv):
@@ -103,7 +100,6 @@ def make_ctx(download_dir: str):
     wait = WebDriverWait(driver, 40)
     actions = ActionChains(driver)
 
-    # Allow downloads via CDP (best-effort; not always required)
     try: driver.execute_cdp_cmd("Network.enable", {})
     except Exception: pass
     try: driver.execute_cdp_cmd("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": download_dir})
@@ -111,9 +107,7 @@ def make_ctx(download_dir: str):
 
     return {"driver": driver, "wait": wait, "actions": actions, "download_dir": download_dir}
 
-# ============================
-# Helpers (no screenshots/debug images)
-# ============================
+# ---------------- Helpers ----------------
 def handle_cookies(ctx):
     drv, wait = ctx["driver"], ctx["wait"]
     for xp in [
@@ -135,7 +129,6 @@ def ensure_language(ctx, lang: str):  # 'nl' or 'fr'
     base = f"https://platform.medipim.be/{'nl/home' if lang=='nl' else 'fr/home'}"
     drv.get(base)
     handle_cookies(ctx)
-    # Switch only if needed
     try:
         trig_span = wait.until(EC.presence_of_element_located(
             (By.CSS_SELECTOR, ".I18nMenu .Dropdown > button.trigger span")))
@@ -170,7 +163,6 @@ def open_export_dropdown(ctx):
     return dd
 
 def click_excel_option(ctx, dropdown):
-    """Click the 'Excel 2007 (.xlsx)' option (2nd button in the actions list)."""
     actions = ctx["actions"]
     excel_btn = dropdown.find_element(By.CSS_SELECTOR, "div.actions > button:nth-of-type(2)")
     label = excel_btn.text.strip().replace("\n", " ")
@@ -180,8 +172,24 @@ def click_excel_option(ctx, dropdown):
     except Exception:
         ctx["driver"].execute_script("arguments[0].click();", excel_btn)
 
+def select_all_attributes(ctx):
+    """Click 'Select all' in any of the supported languages before creating the export."""
+    drv = ctx["driver"]
+    try:
+        all_attr = WebDriverWait(drv, 8).until(
+            EC.element_to_be_clickable((By.XPATH,
+                "//a[contains(., 'Alles selecteren')] | //button[contains(., 'Alles selecteren')] | "
+                "//a[contains(., 'Sélectionner tout') or contains(., 'Selectionner tout')] | "
+                "//button[contains(., 'Sélectionner tout') or contains(., 'Selectionner tout')] | "
+                "//button[contains(., 'Select all')] | //a[contains(., 'Select all')]"
+            ))
+        )
+        drv.execute_script("arguments[0].click();", all_attr)
+    except TimeoutException:
+        # Sometimes the attribute screen isn't shown; that's fine.
+        pass
+
 def wait_for_xlsx_on_disk(ctx, start_time: float, timeout=60) -> pathlib.Path | None:
-    """Wait for an .xlsx file to appear in the download dir after start_time."""
     download_dir = ctx["download_dir"]
     end = time.time() + timeout
     margin = 2.0
@@ -199,7 +207,6 @@ def wait_for_xlsx_on_disk(ctx, start_time: float, timeout=60) -> pathlib.Path | 
     return None
 
 def try_save_xlsx_from_perflog(ctx, timeout=12) -> bytes | None:
-    """Capture XLSX response body via CDP performance logs and return bytes."""
     drv = ctx["driver"]
     deadline = time.time() + timeout
     seen = set()
@@ -214,10 +221,7 @@ def try_save_xlsx_from_perflog(ctx, timeout=12) -> bytes | None:
             logs = []
         for entry in logs:
             try:
-                msg = entry.get('message')
-                if not msg:
-                    continue
-                payload = json.loads(msg)  # message is a JSON string
+                payload = json.loads(entry.get('message', '{}'))
                 m = payload.get("message", {})
             except Exception:
                 continue
@@ -229,8 +233,8 @@ def try_save_xlsx_from_perflog(ctx, timeout=12) -> bytes | None:
             if not req_id or req_id in seen:
                 continue
             seen.add(req_id)
-            mime = resp.get("mimeType", "") or ""
-            url  = (resp.get("url", "") or "").lower()
+            mime = (resp.get("mimeType") or "").lower()
+            url  = (resp.get("url") or "").lower()
             if ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in mime) or url.endswith(".xlsx"):
                 try:
                     body = drv.execute_cdp_cmd('Network.getResponseBody', {'requestId': req_id})
@@ -243,7 +247,7 @@ def try_save_xlsx_from_perflog(ctx, timeout=12) -> bytes | None:
     return None
 
 def run_export_and_get_bytes(ctx, lang: str, refs: str) -> bytes | None:
-    """Open products page, trigger Excel export, and return XLSX bytes via disk or CDP fallback."""
+    """Trigger Excel export (with ALL attributes) and return XLSX bytes (disk or CDP fallback)."""
     ensure_language(ctx, lang)
     if lang == "nl":
         url = f"https://platform.medipim.be/nl/producten?search=refcode[{refs.replace(' ', '%20')}]"
@@ -254,11 +258,15 @@ def run_export_and_get_bytes(ctx, lang: str, refs: str) -> bytes | None:
     drv.get(url)
     handle_cookies(ctx)
 
+    # Open Export and choose Excel
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.SplitButton")))
     dd = open_export_dropdown(ctx)
     click_excel_option(ctx, dd)
 
-    # Start export (Create / Aanmaken / Créer)
+    # >>> IMPORTANT: select ALL attributes <<<
+    select_all_attributes(ctx)
+
+    # Create export (AANMAKEN / Créer / Create)
     try:
         create_btn = WebDriverWait(drv, 25).until(
             EC.element_to_be_clickable((By.XPATH,
@@ -269,9 +277,9 @@ def run_export_and_get_bytes(ctx, lang: str, refs: str) -> bytes | None:
         )
         drv.execute_script("arguments[0].click();", create_btn)
     except TimeoutException:
-        pass  # export may start automatically
+        pass
 
-    # Wait for any "ready" message (best-effort)
+    # Wait for "ready" (best-effort)
     try:
         WebDriverWait(drv, 40).until(
             EC.presence_of_element_located((By.XPATH,
@@ -282,7 +290,7 @@ def run_export_and_get_bytes(ctx, lang: str, refs: str) -> bytes | None:
     except TimeoutException:
         pass
 
-    # Click Download button (or navigate direct href)
+    # Click Download (or direct href)
     dl = wait.until(
         EC.element_to_be_clickable((By.XPATH,
             "//button[contains(., 'DOWNLOAD')] | //a[contains(., 'DOWNLOAD')] | "
@@ -298,14 +306,13 @@ def run_export_and_get_bytes(ctx, lang: str, refs: str) -> bytes | None:
     else:
         drv.execute_script("arguments[0].click();", dl)
 
-    # Try disk first
+    # Disk first
     disk = wait_for_xlsx_on_disk(ctx, start_time=start, timeout=60)
     if disk and disk.exists():
         return disk.read_bytes()
 
-    # Fallback to CDP capture
-    cdp_bytes = try_save_xlsx_from_perflog(ctx, timeout=12)
-    return cdp_bytes
+    # CDP fallback
+    return try_save_xlsx_from_perflog(ctx, timeout=12)
 
 def do_login(ctx, email_addr: str, pwd: str):
     drv, wait = ctx["driver"], ctx["wait"]
@@ -320,8 +327,7 @@ def do_login(ctx, email_addr: str, pwd: str):
         drv.execute_script("arguments[0].click();", submit)
         wait.until(EC.invisibility_of_element_located((By.ID, "form0.email")))
     except TimeoutException:
-        # Session may already be active
-        pass
+        pass  # likely already logged in
 
 def run_both_exports(email: str, password: str, refs: str):
     """Run NL and FR export in two isolated sessions. Return dict with bytes."""
@@ -344,23 +350,18 @@ def run_both_exports(email: str, password: str, refs: str):
                     pass
     return results
 
-# ============================
-# SKU parsing
-# ============================
-def parse_skus(sku_text: str, uploaded_file) -> list[str]:
-    """Merge SKUs from textarea and optional Excel file (column 'sku'). Returns a clean list of strings."""
+# ---------------- SKU parsing ----------------
+def parse_skus(sku_text: str, uploaded_file, dedup_on: bool) -> list[str]:
+    """Merge SKUs from textarea and optional Excel file (column 'sku')."""
     skus = []
 
-    # From textarea
     if sku_text:
         raw = sku_text.replace(",", " ").split()
         skus.extend([x.strip() for x in raw if x.strip()])
 
-    # From Excel
     if uploaded_file is not None:
         try:
             df = pd.read_excel(uploaded_file, engine="openpyxl")
-            # Make columns lowercase to be tolerant
             df.columns = [c.lower() for c in df.columns]
             if "sku" not in df.columns:
                 st.error("The uploaded Excel must contain a 'sku' column.")
@@ -371,7 +372,7 @@ def parse_skus(sku_text: str, uploaded_file) -> list[str]:
             st.error(f"Failed to read Excel: {e}")
             return []
 
-    if dedup:
+    if dedup_on:
         seen, out = set(), []
         for s in skus:
             if s not in seen:
@@ -380,43 +381,48 @@ def parse_skus(sku_text: str, uploaded_file) -> list[str]:
         return out
     return skus
 
-# ============================
-# Action
-# ============================
+# ---------------- Action ----------------
 if submitted:
+    # Reset previous exports so buttons don't show stale files
+    st.session_state["exports"] = {}
+    st.session_state["last_refs"] = ""
+
     if not email or not password:
         st.error("Please enter your email and password.")
     else:
-        skus = parse_skus(sku_text, uploaded)
+        skus = parse_skus(sku_text, uploaded, dedup_on=dedup)
         if not skus:
             st.error("Please provide at least one SKU (textarea or Excel).")
         else:
-            st.info(f"Total SKUs to export: {len(skus)}")
             refs = " ".join(skus)
-
+            st.session_state["last_refs"] = refs
             results = run_both_exports(email, password, refs)
+            # Persist results so download buttons survive reruns
+            if results:
+                st.session_state["exports"] = results
 
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            base = f"medipim_export_{ts}"
-            col1, col2 = st.columns(2)
-            if "nl" in results:
-                with col1:
-                    st.success("NL export ready")
-                    st.download_button(
-                        "Download NL (.xlsx)",
-                        data=io.BytesIO(results["nl"]),
-                        file_name=f"{base}-nl.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-            if "fr" in results:
-                with col2:
-                    st.success("FR export ready")
-                    st.download_button(
-                        "Download FR (.xlsx)",
-                        data=io.BytesIO(results["fr"]),
-                        file_name=f"{base}-fr.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-
-            if not results:
-                st.error("No export could be generated. Please verify credentials/session and try again.")
+# ---------------- Download buttons (persist across reruns) ----------------
+if st.session_state["exports"]:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    base = f"medipim_export_{ts}"
+    col1, col2 = st.columns(2)
+    if "nl" in st.session_state["exports"]:
+        with col1:
+            st.success("NL export ready")
+            st.download_button(
+                "Download NL (.xlsx)",
+                data=io.BytesIO(st.session_state["exports"]["nl"]),
+                file_name=f"{base}-nl.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_nl",  # unique key so clicking NL doesn't affect FR button identity
+            )
+    if "fr" in st.session_state["exports"]:
+        with col2:
+            st.success("FR export ready")
+            st.download_button(
+                "Download FR (.xlsx)",
+                data=io.BytesIO(st.session_state["exports"]["fr"]),
+                file_name=f"{base}-fr.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_fr",
+            )

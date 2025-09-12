@@ -1,6 +1,6 @@
-streamlit==1.38.0
-selenium==4.25.0
-pandas==2.2.2
-openpyxl==3.1.5
-python-dotenv==1.0.1
+streamlit
+selenium
+pandas
+openpyxl
+python-dotenv
 

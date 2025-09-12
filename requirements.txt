@@ -2,5 +2,4 @@ streamlit
 selenium
 pandas
 openpyxl
-python-dotenv
 

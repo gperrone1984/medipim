@@ -1,171 +1,395 @@
-import streamlit as st
-import pandas as pd
-import zipfile
+# app.py
 import os
-import tempfile
-from medipim_api import MedipimAPI
 import io
+import time
+import tempfile
+import pathlib
+import pandas as pd
+import streamlit as st
 
-st.set_page_config(
-    page_title="Medipim Image Downloader",
-    page_icon="📸",
-    layout="wide"
-)
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
-st.title("📸 Medipim Image Downloader")
-st.markdown("Carica una lista di ID prodotto e scarica le immagini 1500x1500 in un file ZIP")
+st.set_page_config(page_title="Medipim Export (NL+FR)", page_icon="📦", layout="centered")
 
-# Sidebar for credentials
-st.sidebar.header("Credenziali Medipim")
-username = st.sidebar.text_input("Username", value="Donique.May@redcare-pharmacy.com")
-password = st.sidebar.text_input("Password", type="password", value="q0gyjs5rbmq")
+# =============== UI ===============
+st.title("Medipim Export (NL + FR)")
 
-# Main content
-col1, col2 = st.columns([1, 1])
+with st.form("login_form", clear_on_submit=False):
+    st.subheader("Login")
+    email = st.text_input("Email", value="", autocomplete="username")
+    password = st.text_input("Password", value="", type="password", autocomplete="current-password")
 
-with col1:
-    st.header("📋 Carica Lista Prodotti")
-    
-    # Option 1: Upload CSV file
-    uploaded_file = st.file_uploader("Carica file CSV con ID prodotti", type=['csv'])
-    
+    st.subheader("SKU input")
+    sku_text = st.text_area(
+        "Paste SKUs (separated by spaces, commas, or newlines)",
+        height=120,
+        placeholder="e.g. 4811337 4811352\n4811329, 4811345",
+    )
+    uploaded = st.file_uploader("Or upload an Excel with a 'sku' column", type=["xlsx"])
+    dedup = st.checkbox("Deduplicate SKUs", value=True)
+    submitted = st.form_submit_button("Run NL + FR export")
+
+# =============== Utilities ===============
+def parse_skus(sku_text: str, uploaded_file) -> list[str]:
+    """Merge SKUs from textarea and optional Excel file (column 'sku'). Return a clean list of unique strings."""
+    skus = []
+
+    # From textarea
+    if sku_text:
+        # split by any whitespace or comma
+        raw = sku_text.replace(",", " ").split()
+        skus.extend([x.strip() for x in raw if x.strip()])
+
+    # From Excel
     if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        st.write("Anteprima del file:")
-        st.dataframe(df.head())
-        
-        # Let user select which column contains product IDs
-        if len(df.columns) > 1:
-            id_column = st.selectbox("Seleziona la colonna con gli ID prodotto:", df.columns)
-            product_ids = df[id_column].tolist()
-        else:
-            product_ids = df.iloc[:, 0].tolist()
-    else:
-        # Option 2: Manual input
-        st.markdown("**Oppure inserisci manualmente gli ID prodotto:**")
-        manual_input = st.text_area(
-            "ID Prodotti (uno per riga)",
-            placeholder="4811337\n4811338\n4811339",
-            height=150
-        )
-        
-        if manual_input:
-            product_ids = [id.strip() for id in manual_input.split('\n') if id.strip()]
-        else:
-            product_ids = []
+        try:
+            df = pd.read_excel(uploaded_file, engine="openpyxl")
+            if "sku" not in df.columns.str.lower().tolist():
+                # be tolerant with case
+                # map columns to lower
+                df.columns = [c.lower() for c in df.columns]
+            if "sku" not in df.columns:
+                st.error("The uploaded Excel must contain a 'sku' column.")
+                return []
+            ex_skus = (
+                df["sku"]
+                .astype(str)
+                .map(lambda x: x.strip())
+                .tolist()
+            )
+            skus.extend([x for x in ex_skus if x])
+        except Exception as e:
+            st.error(f"Failed to read Excel: {e}")
+            return []
 
-with col2:
-    st.header("⚙️ Configurazione Download")
-    
-    if product_ids:
-        st.success(f"Trovati {len(product_ids)} ID prodotto")
-        st.write("ID prodotti da processare:")
-        for i, pid in enumerate(product_ids[:10]):  # Show first 10
-            st.write(f"• {pid}")
-        if len(product_ids) > 10:
-            st.write(f"... e altri {len(product_ids) - 10} prodotti")
-    
-    # Download button
-    if st.button("🚀 Avvia Download", disabled=not product_ids or not username or not password):
-        if not username or not password:
-            st.error("Inserisci username e password")
-        elif not product_ids:
-            st.error("Inserisci almeno un ID prodotto")
-        else:
-            # Initialize progress tracking
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            results_container = st.container()
-            
-            # Initialize API
-            api = MedipimAPI(username, password)
-            
-            # Login
-            status_text.text("Effettuando login...")
-            if not api.login():
-                st.error("Errore durante il login. Le credenziali potrebbero essere corrette ma la sessione non è stata autenticata. Riprova e, se persiste, aggiorna l'app. ")
-                st.stop()
-            
-            status_text.text("Login effettuato con successo!")
-            
-            # Create temporary directory for images
-            temp_dir = tempfile.mkdtemp()
-            downloaded_images = []
-            failed_downloads = []
-            
-            # Process each product ID
-            for i, product_id in enumerate(product_ids):
-                progress = (i + 1) / len(product_ids)
-                progress_bar.progress(progress)
-                status_text.text(f"Processando prodotto {product_id} ({i+1}/{len(product_ids)})")
-                
-                try:
-                    # Search for product
-                    product_url = api.search_product(product_id)
-                    if not product_url:
-                        failed_downloads.append(f"{product_id}: Prodotto non trovato")
-                        continue
-                    
-                    # Get image URL
-                    image_url = api.get_image_url(product_url)
-                    if not image_url:
-                        failed_downloads.append(f"{product_id}: Immagine non trovata")
-                        continue
-                    
-                    # Download image
-                    image_path = os.path.join(temp_dir, f"{product_id}.jpg")
-                    if api.download_image(image_url, image_path):
-                        downloaded_images.append((product_id, image_path))
-                    else:
-                        failed_downloads.append(f"{product_id}: Errore durante il download")
-                        
-                except Exception as e:
-                    failed_downloads.append(f"{product_id}: {str(e)}")
-            
-            # Create ZIP file
-            if downloaded_images:
-                status_text.text("Creando file ZIP...")
-                zip_buffer = io.BytesIO()
-                
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    for product_id, image_path in downloaded_images:
-                        zip_file.write(image_path, f"{product_id}.jpg")
-                
-                zip_buffer.seek(0)
-                
-                # Show results
-                with results_container:
-                    st.success(f"✅ Download completato! {len(downloaded_images)} immagini scaricate")
-                    
-                    if failed_downloads:
-                        st.warning(f"⚠️ {len(failed_downloads)} download falliti:")
-                        for failure in failed_downloads:
-                            st.write(f"• {failure}")
-                    
-                    # Download button for ZIP
-                    st.download_button(
-                        label="📥 Scarica ZIP con immagini",
-                        data=zip_buffer.getvalue(),
-                        file_name=f"medipim_images_{len(downloaded_images)}_products.zip",
-                        mime="application/zip"
-                    )
-                
-                # Cleanup
-                for _, image_path in downloaded_images:
-                    try:
-                        os.remove(image_path)
-                    except:
-                        pass
-                os.rmdir(temp_dir)
-                
-                status_text.text("✅ Processo completato!")
+    if dedup:
+        # preserve order while deduping
+        seen = set()
+        out = []
+        for s in skus:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+    return skus
+
+def make_ctx(download_dir: str):
+    """Create a headless Chrome session with its own download directory and CDP enabled."""
+    opt = webdriver.ChromeOptions()
+    opt.add_argument("--headless=new")
+    opt.add_argument("--no-sandbox")
+    opt.add_argument("--disable-dev-shm-usage")
+    opt.add_argument("--window-size=1440,1000")
+    # Allow automatic downloads
+    opt.add_experimental_option("prefs", {
+        "download.default_directory": download_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "download_restrictions": 0,
+        "safebrowsing.enabled": True,
+        "safebrowsing.disable_download_protection": True,
+        "profile.default_content_setting_values.automatic_downloads": 1,
+    })
+    opt.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+
+    driver = webdriver.Chrome(options=opt)
+    wait = WebDriverWait(driver, 40)
+    actions = ActionChains(driver)
+
+    # Enable CDP & allow downloads
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+    except Exception:
+        pass
+    try:
+        driver.execute_cdp_cmd("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": download_dir})
+    except Exception:
+        pass
+
+    return {"driver": driver, "wait": wait, "actions": actions, "download_dir": download_dir}
+
+def handle_cookies(ctx):
+    drv, wait = ctx["driver"], ctx["wait"]
+    for xp in [
+        "//button[contains(., 'Alles accepteren')]",
+        "//button[contains(., 'Ik ga akkoord')]",
+        "//button[contains(., 'Accepter') or contains(., 'Tout accepter')]",
+        "//button[contains(., 'OK')]",
+        "//button[contains(., 'Accept all') or contains(., 'Accept')]",
+    ]:
+        try:
+            btn = WebDriverWait(drv, 3).until(EC.element_to_be_clickable((By.XPATH, xp)))
+            drv.execute_script("arguments[0].click();", btn)
+            break
+        except Exception:
+            pass
+
+def ensure_language(ctx, lang: str):  # 'nl' or 'fr'
+    drv, wait = ctx["driver"], ctx["wait"]
+    base = f"https://platform.medipim.be/{'nl/home' if lang=='nl' else 'fr/home'}"
+    drv.get(base)
+    handle_cookies(ctx)
+    # Try to switch only if needed
+    try:
+        trig_span = wait.until(EC.presence_of_element_located(
+            (By.CSS_SELECTOR, ".I18nMenu .Dropdown > button.trigger span")))
+        current = trig_span.text.strip().lower()
+    except TimeoutException:
+        current = ""
+    if current != lang:
+        try:
+            trig = drv.find_element(By.CSS_SELECTOR, ".I18nMenu .Dropdown > button.trigger")
+            drv.execute_script("arguments[0].click();", trig); time.sleep(0.2)
+            if lang == "nl":
+                lang_link = wait.until(EC.element_to_be_clickable(
+                    (By.XPATH, "//div[contains(@class,'I18nMenu')]//a[contains(@href,'/nl/')]")))
             else:
-                st.error("❌ Nessuna immagine è stata scaricata con successo")
-                if failed_downloads:
-                    st.write("Errori:")
-                    for failure in failed_downloads:
-                        st.write(f"• {failure}")
+                lang_link = wait.until(EC.element_to_be_clickable(
+                    (By.XPATH, "//div[contains(@class,'I18nMenu')]//a[contains(@href,'/fr/')]")))
+            drv.execute_script("arguments[0].click();", lang_link); time.sleep(0.4)
+        except TimeoutException:
+            pass
 
-# Footer
-st.markdown("---")
-st.markdown("**Nota:** Assicurati di avere le credenziali corrette per accedere alla piattaforma Medipim.")
+def open_export_dropdown(ctx):
+    drv, wait = ctx["driver"], ctx["wait"]
+    split = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.SplitButton")))
+    trigger = split.find_element(By.CSS_SELECTOR, "button.trigger")
+    for _ in range(4):
+        if trigger.get_attribute("aria-expanded") == "true":
+            break
+        drv.execute_script("arguments[0].click();", trigger); time.sleep(0.25)
+    if trigger.get_attribute("aria-expanded") != "true":
+        raise TimeoutException("Export dropdown did not open.")
+    dd = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.Dropdown.open div.dropdown")))
+    return dd
+
+def click_excel_option(ctx, dropdown):
+    """Click the 'Excel 2007 (.xlsx)' option (2nd button in the actions list)."""
+    actions = ctx["actions"]
+    excel_btn = dropdown.find_element(By.CSS_SELECTOR, "div.actions > button:nth-of-type(2)")
+    label = excel_btn.text.strip().replace("\n", " ")
+    assert ("excel" in label.lower()) or ("xlsx" in label.lower())
+    try:
+        actions.move_to_element(excel_btn).pause(0.1).click().perform()
+    except Exception:
+        ctx["driver"].execute_script("arguments[0].click();", excel_btn)
+
+def wait_for_xlsx_on_disk(ctx, start_time: float, timeout=60) -> pathlib.Path | None:
+    """Wait for an .xlsx file to appear in the download dir after start_time."""
+    download_dir = ctx["download_dir"]
+    end = time.time() + timeout
+    margin = 2.0
+    while time.time() < end:
+        files = [
+            (f, os.path.getmtime(os.path.join(download_dir, f)))
+            for f in os.listdir(download_dir)
+            if f.lower().endswith(".xlsx")
+        ]
+        fresh = [f for f, m in files if m >= (start_time - margin)]
+        if fresh:
+            # return freshest
+            fresh.sort(key=lambda f: os.path.getmtime(os.path.join(download_dir, f)), reverse=True)
+            return pathlib.Path(os.path.join(download_dir, fresh[0]))
+        time.sleep(0.5)
+    return None
+
+def try_save_xlsx_from_perflog(ctx, timeout=12) -> bytes | None:
+    """Capture XLSX response body via CDP performance logs and return bytes."""
+    drv = ctx["driver"]
+    deadline = time.time() + timeout
+    seen = set()
+    try:
+        drv.execute_cdp_cmd("Network.enable", {})
+    except Exception:
+        pass
+    while time.time() < deadline:
+        try:
+            logs = drv.get_log('performance')
+        except Exception:
+            logs = []
+        for entry in logs:
+            try:
+                msg = entry and entry.get("message")
+                if not msg:
+                    continue
+                m = eval(msg) if msg.startswith("{") else None  # performance log is JSON string
+                if not m:
+                    continue
+                m = m.get("message", {})
+            except Exception:
+                # Try strict JSON parsing as fallback
+                import json
+                try:
+                    m = json.loads(msg).get("message", {})
+                except Exception:
+                    continue
+            if m.get("method") != "Network.responseReceived":
+                continue
+            params = m.get("params", {})
+            resp = params.get("response", {})
+            req_id = params.get("requestId")
+            if not req_id or req_id in seen:
+                continue
+            seen.add(req_id)
+            mime = resp.get("mimeType", "")
+            url  = resp.get("url", "")
+            if ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in mime) or url.lower().endswith(".xlsx"):
+                try:
+                    body = drv.execute_cdp_cmd('Network.getResponseBody', {'requestId': req_id})
+                    data = body.get('body', '')
+                    import base64
+                    raw = base64.b64decode(data) if body.get('base64Encoded') else data.encode('utf-8', 'ignore')
+                    return raw
+                except Exception:
+                    pass
+        time.sleep(0.4)
+    return None
+
+def run_export_and_get_bytes(ctx, lang: str, refs: str) -> bytes | None:
+    """Open products page, trigger Excel export, and return XLSX bytes via disk or CDP fallback."""
+    ensure_language(ctx, lang)
+    if lang == "nl":
+        url = f"https://platform.medipim.be/nl/producten?search=refcode[{refs.replace(' ', '%20')}]"
+    else:
+        url = f"https://platform.medipim.be/fr/produits?search=refcode[{refs.replace(' ', '%20')}]"
+
+    drv, wait = ctx["driver"], ctx["wait"]
+    drv.get(url)
+    handle_cookies(ctx)
+
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.SplitButton")))
+    dd = open_export_dropdown(ctx)
+    click_excel_option(ctx, dd)
+
+    # Start export
+    try:
+        create_btn = WebDriverWait(drv, 25).until(
+            EC.element_to_be_clickable((By.XPATH,
+                "//button[contains(., 'AANMAKEN')] | //button[contains(., 'Aanmaken')] | "
+                "//button[contains(., 'Create')] | "
+                "//button[contains(., 'Créer') or contains(., 'Creer')]"
+            ))
+        )
+        drv.execute_script("arguments[0].click();", create_btn)
+    except TimeoutException:
+        pass  # export may start automatically
+
+    # Wait for any "ready" message (best-effort)
+    try:
+        WebDriverWait(drv, 40).until(
+            EC.presence_of_element_located((By.XPATH,
+                "//*[contains(., 'Export is klaar') or contains(., 'Export gereed') or "
+                "contains(., 'Export ready') or contains(., 'Export prêt') or contains(., 'Export est prêt')]"
+            ))
+        )
+    except TimeoutException:
+        pass
+
+    # Click Download button (or navigate direct href)
+    dl = wait.until(
+        EC.element_to_be_clickable((By.XPATH,
+            "//button[contains(., 'DOWNLOAD')] | //a[contains(., 'DOWNLOAD')] | "
+            "//button[contains(., 'Download')] | //a[contains(., 'Download')] | "
+            "//button[contains(., 'Télécharger') or contains(., 'Telecharger')] | "
+            "//a[contains(., 'Télécharger') or contains(., 'Telecharger')]"
+        ))
+    )
+    href = (dl.get_attribute("href") or dl.get_attribute("data-href") or "").strip().lower()
+    start = time.time()
+    if href and (not href.startswith("javascript")) and (not href.startswith("blob:")):
+        drv.get(href)
+    else:
+        drv.execute_script("arguments[0].click();", dl)
+
+    # Try disk first
+    disk = wait_for_xlsx_on_disk(ctx, start_time=start, timeout=60)
+    if disk and disk.exists():
+        return disk.read_bytes()
+
+    # Fallback to CDP capture
+    cdp_bytes = try_save_xlsx_from_perflog(ctx, timeout=12)
+    return cdp_bytes
+
+def do_login(ctx, email_addr: str, pwd: str):
+    drv, wait = ctx["driver"], ctx["wait"]
+    drv.get("https://platform.medipim.be/nl/inloggen")
+    handle_cookies(ctx)
+    try:
+        email_el = wait.until(EC.presence_of_element_located((By.ID, "form0.email")))
+        pwd_el   = wait.until(EC.presence_of_element_located((By.ID, "form0.password")))
+        email_el.clear(); email_el.send_keys(email_addr)
+        pwd_el.clear();   pwd_el.send_keys(pwd)
+        submit = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.SubmitButton")))
+        drv.execute_script("arguments[0].click();", submit)
+        wait.until(EC.invisibility_of_element_located((By.ID, "form0.email")))
+    except TimeoutException:
+        # Session may already be active
+        pass
+
+def run_both_exports(email: str, password: str, refs: str):
+    """Run NL and FR export in two isolated sessions. Return dict with bytes."""
+    results = {}
+    for lang in ("nl", "fr"):
+        with st.spinner(f"Running {lang.upper()} export..."):
+            tmpdir = tempfile.mkdtemp(prefix=f"medipim_{lang}_")
+            ctx = make_ctx(tmpdir)
+            try:
+                do_login(ctx, email, password)
+                data = run_export_and_get_bytes(ctx, lang, refs)
+                if data:
+                    results[lang] = data
+                else:
+                    st.error(f"{lang.upper()} export failed: no XLSX found.")
+            finally:
+                try:
+                    ctx["driver"].quit()
+                except Exception:
+                    pass
+    return results
+
+# =============== Action ===============
+if submitted:
+    # Basic validations
+    if not email or not password:
+        st.error("Please enter your email and password.")
+    else:
+        skus = parse_skus(sku_text, uploaded)
+        if not skus:
+            st.error("Please provide at least one SKU (textarea or Excel).")
+        else:
+            st.info(f"Total SKUs to export: {len(skus)}")
+            refs = " ".join(skus)
+
+            # Run both exports
+            results = run_both_exports(email, password, refs)
+
+            # Offer downloads
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            base = f"medipim_export_{ts}"
+            col1, col2 = st.columns(2)
+            if "nl" in results:
+                with col1:
+                    st.success("NL export ready")
+                    st.download_button(
+                        "Download NL (.xlsx)",
+                        data=io.BytesIO(results["nl"]),
+                        file_name=f"{base}-nl.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+            if "fr" in results:
+                with col2:
+                    st.success("FR export ready")
+                    st.download_button(
+                        "Download FR (.xlsx)",
+                        data=io.BytesIO(results["fr"]),
+                        file_name=f"{base}-fr.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+            if not results:
+                st.error("No export could be generated. Please verify credentials and try again.")

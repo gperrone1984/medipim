@@ -8,6 +8,7 @@ import pathlib
 import hashlib
 import zipfile
 from typing import Dict, List, Tuple, Optional
+import shutil
 
 import pandas as pd
 import streamlit as st
@@ -57,6 +58,24 @@ with st.form("login_form", clear_on_submit=False):
     scope = st.radio("Select images", ["All (NL + FR)", "NL only", "FR only"], index=0, horizontal=True)
 
     submitted = st.form_submit_button("Download photos")
+
+# Clear cache & data button just under the form
+clear_clicked = st.button("Clear cache and data", help="Delete temporary files and reset the app state")
+if clear_clicked:
+    # Reset session state
+    for k in ("exports", "photo_zip", "missing_lists"):
+        st.session_state[k] = {}
+    # Remove temp folders created by the app/chrome
+    removed = 0
+    tmp_root = tempfile.gettempdir()
+    for name in os.listdir(tmp_root):
+        if name.startswith(("medipim_", "chrome-user-")):
+            try:
+                shutil.rmtree(os.path.join(tmp_root, name), ignore_errors=True)
+                removed += 1
+            except Exception:
+                pass
+    st.success(f"Cache cleared. Removed {removed} temp folder(s) and reset state.")
 
 # ===============================
 # Selenium driver + helpers (full implementation)
@@ -571,6 +590,43 @@ def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> T
 # ===============================
 # Orchestrator
 # ===============================
+
+class ScaledProgress:
+    """Proxy around a single Streamlit progress bar, scaled to a [start,end] window."""
+    def __init__(self, widget, start: float, end: float):
+        self.widget = widget
+        self.start = float(start)
+        self.end = float(end)
+    def progress(self, frac: float):
+        frac = max(0.0, min(1.0, float(frac)))
+        val = self.start + (self.end - self.start) * frac
+        self.widget.progress(min(1.0, max(0.0, val)))
+
+
+def run_exports_with_progress(email: str, password: str, refs: str, langs: List[str], prog_widget, start: float, end: float):
+    """Run exports for given languages, updating a single progress bar.
+    Returns {lang: xlsx_bytes}.
+    """
+    results = {}
+    step = (end - start) / max(1, len(langs))
+    for i, lang in enumerate(langs):
+        prog_widget.progress(start + step * i)
+        tmpdir = tempfile.mkdtemp(prefix=f"medipim_{lang}_")
+        ctx = make_ctx(tmpdir)
+        try:
+            do_login(ctx, email, password)
+            data = run_export_and_get_bytes(ctx, lang, refs)
+            if data:
+                results[lang] = data
+            else:
+                st.error(f"{lang.upper()} export failed: no XLSX found.")
+        finally:
+            try:
+                ctx["driver"].quit()
+            except Exception:
+                pass
+        prog_widget.progress(start + step * (i + 1))
+    return results
 if submitted:
     st.session_state["exports"] = {}
     st.session_state["photo_zip"] = {}
@@ -591,20 +647,38 @@ if submitted:
             else:
                 langs = ["nl", "fr"]
 
-            results = run_exports(email, password, refs, langs)
+            # Single combined progress bar
+            main_prog = st.progress(0.0)
+            # Phase 1: exports (0.0 → 0.5 if one lang, 0.0 → 0.6 if two)
+            export_end = 0.5 if len(langs) == 1 else 0.6
+            results = run_exports_with_progress(email, password, refs, langs, main_prog, 0.0, export_end)
             if not results:
                 st.stop()
 
-            for lg in langs:
+            # Phase 2: photo processing per language over remaining range
+            proc_start = export_end
+            proc_end = 1.0
+            per_lang = (proc_end - proc_start) / max(1, len(langs))
+
+            for i, lg in enumerate(langs):
                 if lg in results:
                     st.info(f"Processing {lg.upper()} images…")
-                    p = st.progress(0.0)
-                    z_lg, a_lg, s_lg, miss = build_zip_for_lang(results[lg], lang=lg, progress=p)
+                    scaled = ScaledProgress(main_prog, proc_start + per_lang * i, proc_start + per_lang * (i + 1))
+                    z_lg, a_lg, s_lg, miss = build_zip_for_lang(results[lg], lang=lg, progress=scaled)
                     st.session_state["photo_zip"][lg] = z_lg
                     st.session_state["missing_lists"][lg] = miss
                     st.success(f"{lg.upper()}: saved {s_lg} images.")
+            main_prog.progress(1.0)
 
             if scope == "All (NL + FR)" and ("nl" in st.session_state["photo_zip"] or "fr" in st.session_state["photo_zip"]):
+                combo = io.BytesIO()
+                with zipfile.ZipFile(combo, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+                    for lg in ("nl", "fr"):
+                        if lg in st.session_state["photo_zip"]:
+                            with zipfile.ZipFile(io.BytesIO(st.session_state["photo_zip"][lg])) as zlg:
+                                for name in zlg.namelist():
+                                    z.writestr(name, zlg.read(name))
+                st.session_state["photo_zip"]["all"] = combo.getvalue()ip"] or "fr" in st.session_state["photo_zip"]):
                 combo = io.BytesIO()
                 with zipfile.ZipFile(combo, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
                     for lg in ("nl", "fr"):

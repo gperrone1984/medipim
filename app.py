@@ -378,6 +378,7 @@ def parse_skus(sku_text: str, uploaded_file) -> List[str]:
 # ===============================
 # Photo processing
 # ===============================
+DEDUP_DHASH_THRESHOLD = 3  # Hamming distance threshold for perceptual dedup (0..64)
 TYPE_RANK = {
     "photo du produit": 1,
     "productfoto": 1,
@@ -466,6 +467,28 @@ def _jpeg_bytes(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
+def _dhash(image: Image.Image, hash_size: int = 8) -> int:
+    """Perceptual difference hash (dHash). Returns an integer (hash_size*hash_size bits)."""
+    img = image.convert("L").resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
+    pixels = list(img.getdata())
+    w = hash_size + 1
+    bits = []
+    for row in range(hash_size):
+        row_start = row * w
+        for col in range(hash_size):
+            left = pixels[row_start + col]
+            right = pixels[row_start + col + 1]
+            bits.append(1 if left > right else 0)
+    val = 0
+    for b in bits:
+        val = (val << 1) | b
+    return val
+
+
+def _hamming(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
 def _hash_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
@@ -493,6 +516,7 @@ def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> T
     attempted = 0
     saved = 0
     cnk_hashes: Dict[str, set] = {}
+    cnk_phashes: Dict[str, List[int]] = {}
     missing: List[Dict[str, str]] = []
 
     total = len(photos)
@@ -513,15 +537,24 @@ def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> T
             continue
 
         processed = _to_1000_canvas(img)
+        dh = _dhash(processed, hash_size=8)  # 64-bit perceptual hash
         jb = _jpeg_bytes(processed)
         h = _hash_bytes(jb)
 
         if cnk not in cnk_hashes:
             cnk_hashes[cnk] = set()
+        if cnk not in cnk_phashes:
+            cnk_phashes[cnk] = []
+
+        # Exact duplicate (identical bytes)
         if h in cnk_hashes[cnk]:
+            continue
+        # Near-duplicate (perceptual dHash within threshold)
+        if any(_hamming(dh, existing) <= DEDUP_DHASH_THRESHOLD for existing in cnk_phashes[cnk]):
             continue
 
         cnk_hashes[cnk].add(h)
+        cnk_phashes[cnk].append(dh)
         n = len(cnk_hashes[cnk])
         filename = f"BE0{cnk}-{lang}-h{n}.jpg"
         zf.writestr(filename, jb)

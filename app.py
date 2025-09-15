@@ -7,7 +7,7 @@ import tempfile
 import pathlib
 import hashlib
 import zipfile
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -26,19 +26,17 @@ from selenium.webdriver.support import expected_conditions as EC
 # ===============================
 # Streamlit config
 # ===============================
-st.set_page_config(page_title="Medipim Export → Photo Downloader (NL/FR)", page_icon="📦", layout="centered")
-st.title("Medipim Export (NL + FR) → Photo Downloader")
+st.set_page_config(page_title="Medipim Export → Photos (NL/FR)", page_icon="📦", layout="centered")
+st.title("Medipim: Login → Export → Download Photos (NL/FR)")
 
 # ---------------- Session state ----------------
 if "exports" not in st.session_state:
     st.session_state["exports"] = {}    # {"nl": bytes, "fr": bytes}
-if "last_refs" not in st.session_state:
-    st.session_state["last_refs"] = ""
 if "photo_zip" not in st.session_state:
     st.session_state["photo_zip"] = {}  # {"nl": bytes, "fr": bytes, "all": bytes}
 
 # ===============================
-# UI — Login & SKUs (same as prima)
+# UI — Login & SKUs
 # ===============================
 with st.form("login_form", clear_on_submit=False):
     st.subheader("Login")
@@ -51,10 +49,12 @@ with st.form("login_form", clear_on_submit=False):
         height=120,
         placeholder="e.g. 4811337 4811352\n4811329, 4811345",
     )
-    uploaded_skus = st.file_uploader("Or upload an Excel with a 'sku' column", type=["xlsx"], key="xls_skus")
-    dedup = st.checkbox("Deduplicate SKUs", value=True)
+    uploaded_skus = st.file_uploader("Or upload an Excel with a 'sku' column (optional)", type=["xlsx"], key="xls_skus")
 
-    submitted = st.form_submit_button("Run NL + FR export")
+    st.subheader("Scope")
+    scope = st.radio("What do you want to download?", ["All (NL + FR)", "NL only", "FR only"], index=0, horizontal=True)
+
+    submitted = st.form_submit_button("Run export and download photos")
 
 # ===============================
 # Selenium driver factory & helpers
@@ -331,9 +331,9 @@ def do_login(ctx, email_addr: str, pwd: str):
         pass
 
 
-def run_both_exports(email: str, password: str, refs: str):
+def run_exports(email: str, password: str, refs: str, langs: List[str]):
     results = {}
-    for lang in ("nl", "fr"):
+    for lang in langs:
         with st.spinner(f"Running {lang.upper()} export…"):
             tmpdir = tempfile.mkdtemp(prefix=f"medipim_{lang}_")
             ctx = make_ctx(tmpdir)
@@ -352,9 +352,9 @@ def run_both_exports(email: str, password: str, refs: str):
     return results
 
 # ===============================
-# SKU parsing
+# SKU parsing (always deduplicated — no checkbox)
 # ===============================
-def parse_skus(sku_text: str, uploaded_file, dedup_on: bool) -> List[str]:
+def parse_skus(sku_text: str, uploaded_file) -> List[str]:
     skus: List[str] = []
     if sku_text:
         raw = sku_text.replace(",", " ").split()
@@ -363,25 +363,23 @@ def parse_skus(sku_text: str, uploaded_file, dedup_on: bool) -> List[str]:
         try:
             df = pd.read_excel(uploaded_file, engine="openpyxl")
             df.columns = [c.lower() for c in df.columns]
-            if "sku" not in df.columns:
-                st.error("The uploaded Excel must contain a 'sku' column.")
-                return []
-            ex_skus = df["sku"].astype(str).map(lambda x: x.strip()).tolist()
-            skus.extend([x for x in ex_skus if x])
+            if "sku" in df.columns:
+                ex_skus = df["sku"].astype(str).map(lambda x: x.strip()).tolist()
+                skus.extend([x for x in ex_skus if x])
+            else:
+                st.warning("Uploaded Excel has no 'sku' column; ignoring file.")
         except Exception as e:
-            st.error(f"Failed to read Excel: {e}")
-            return []
-    if dedup_on:
-        seen, out = set(), []
-        for s in skus:
-            if s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out
-    return skus
+            st.error(f"Failed to read uploaded Excel: {e}")
+    # Always deduplicate
+    seen, out = set(), []
+    for s in skus:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 # ===============================
-# Photo processing (IDs as strings, no type selection — process all, priority by Type→Photo ID)
+# Photo processing (IDs as strings, priority by Type→Photo ID, always dedup)
 # ===============================
 TYPE_RANK = {
     "photo du produit": 1,
@@ -477,15 +475,13 @@ def _hash_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
 
-def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> Tuple[bytes, int, int]:
+def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress, global_hashes: Optional[Dict[str, set]] = None) -> Tuple[bytes, int, int]:
     products_df, photos_df = _read_book(xlsx_bytes)
     id_cnk = _extract_id_cnk(products_df)
     photos = _extract_photos(photos_df)
 
-    # Map Product ID (string) -> CNK
     id2cnk: Dict[str, str] = {str(row["ID"]).strip(): str(row["CNK"]).strip() for _, row in id_cnk.iterrows()}
 
-    # Sort by priority: Type rank → Photo ID (numeric) within each Product ID
     def _rank_type(t: str) -> int:
         if not isinstance(t, str):
             return 99
@@ -496,14 +492,12 @@ def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> T
     photos["rank_photoid"] = pd.to_numeric(photos["Photo ID"], errors="coerce").fillna(10**9).astype(int)
     photos.sort_values(["Product ID", "rank_type", "rank_photoid"], inplace=True)
 
-    # Build zip
     zip_buf = io.BytesIO()
     zf = zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED)
 
     attempted = 0
     saved = 0
-    cnk_hashes: Dict[str, set] = {}
-    cnk_counts: Dict[str, int] = {}
+    cnk_hashes: Dict[str, set] = global_hashes if global_hashes is not None else {}
 
     total = len(photos)
     last_update = 0
@@ -542,9 +536,7 @@ def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> T
             continue
 
         cnk_hashes[cnk].add(h)
-        cnk_counts[cnk] = cnk_counts.get(cnk, 0) + 1
-        n = cnk_counts[cnk]
-
+        n = len(cnk_hashes[cnk])
         filename = f"BE0{cnk}-{lang}-h{n}.jpg"
         zf.writestr(filename, jb)
         saved += 1
@@ -558,96 +550,66 @@ def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> T
     return zip_buf.getvalue(), attempted, saved
 
 # ===============================
-# Run exports when user submits
+# Orchestrator
 # ===============================
 if submitted:
     st.session_state["exports"] = {}
     st.session_state["photo_zip"] = {}
-    st.session_state["last_refs"] = ""
 
     if not email or not password:
         st.error("Please enter your email and password.")
     else:
-        # Merge SKUs from textarea + optional Excel
-        def parse_and_merge():
-            skus: List[str] = []
-            if sku_text:
-                skus.extend([x.strip() for x in sku_text.replace(",", " ").split() if x.strip()])
-            if uploaded_skus is not None:
-                try:
-                    df = pd.read_excel(uploaded_skus, engine="openpyxl")
-                    df.columns = [c.lower() for c in df.columns]
-                    if "sku" in df.columns:
-                        skus.extend(df["sku"].astype(str).map(lambda x: x.strip()).tolist())
-                    else:
-                        st.warning("Uploaded Excel has no 'sku' column; ignoring file.")
-                except Exception as e:
-                    st.error(f"Failed to read uploaded Excel: {e}")
-            if dedup:
-                seen, out = set(), []
-                for s in skus:
-                    if s not in seen:
-                        seen.add(s)
-                        out.append(s)
-                return out
-            return skus
-
-        skus = parse_and_merge()
+        # SKUs (always deduplicated)
+        skus = parse_skus(sku_text, uploaded_skus)
         if not skus:
             st.error("Please provide at least one SKU (textarea or Excel).")
         else:
             refs = " ".join(skus)
-            st.session_state["last_refs"] = refs
-            results = run_both_exports(email, password, refs)
-            if results:
-                st.session_state["exports"] = results
+
+            # Decide languages from scope
+            if scope == "NL only":
+                langs = ["nl"]
+            elif scope == "FR only":
+                langs = ["fr"]
+            else:
+                langs = ["nl", "fr"]
+
+            # Run exports
+            results = run_exports(email, password, refs, langs)
+            if not results:
+                st.stop()
+
+            # Process photos
+            if scope == "All (NL + FR)":
+                st.info("Processing NL + FR images…")
+                global_hashes: Dict[str, set] = {}
+                zips_local = {}
+                for lg in ["nl", "fr"]:
+                    if lg in results:
+                        p = st.progress(0.0)
+                        z_lg, a_lg, s_lg = build_zip_for_lang(results[lg], lang=lg, progress=p, global_hashes=global_hashes)
+                        zips_local[lg] = z_lg
+                        st.success(f"{lg.upper()}: saved {s_lg} images.")
+                # Combine into ALL
+                if zips_local:
+                    combo = io.BytesIO()
+                    with zipfile.ZipFile(combo, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+                        for lg in ("nl", "fr"):
+                            if lg in zips_local:
+                                with zipfile.ZipFile(io.BytesIO(zips_local[lg])) as zlg:
+                                    for name in zlg.namelist():
+                                        z.writestr(name, zlg.read(name))
+                    st.session_state["photo_zip"]["all"] = combo.getvalue()
+            else:
+                lg = langs[0]
+                st.info(f"Processing {lg.upper()} images…")
+                p = st.progress(0.0)
+                z_lg, a_lg, s_lg = build_zip_for_lang(results[lg], lang=lg, progress=p)
+                st.session_state["photo_zip"][lg] = z_lg
+                st.success(f"{lg.upper()}: saved {s_lg} images.")
 
 # ===============================
-# Photo Processor — scope: ALL / NL / FR
-# ===============================
-if st.session_state["exports"]:
-    st.markdown("---")
-    st.subheader("Photo Processor")
-    scope = st.radio("Download scope", ["All (NL + FR)", "NL only", "FR only"], index=0, horizontal=True)
-    go_photos = st.button("Process & Download Photos")
-
-    if go_photos:
-        st.session_state["photo_zip"] = {}
-        if scope in ("All (NL + FR)", "NL only") and ("nl" in st.session_state["exports"]):
-            st.info("Processing NL images…")
-            p = st.progress(0.0)
-            try:
-                z_nl, a_nl, s_nl = build_zip_for_lang(st.session_state["exports"]["nl"], lang="nl", progress=p)
-                st.session_state["photo_zip"]["nl"] = z_nl
-                st.success(f"NL: saved {s_nl} images.")
-            except Exception as e:
-                st.error(f"NL processing failed: {e}")
-
-        if scope in ("All (NL + FR)", "FR only") and ("fr" in st.session_state["exports"]):
-            st.info("Processing FR images…")
-            p = st.progress(0.0)
-            try:
-                z_fr, a_fr, s_fr = build_zip_for_lang(st.session_state["exports"]["fr"], lang="fr", progress=p)
-                st.session_state["photo_zip"]["fr"] = z_fr
-                st.success(f"FR: saved {s_fr} images.")
-            except Exception as e:
-                st.error(f"FR processing failed: {e}")
-
-        # Combine if ALL requested and both avail
-        if scope == "All (NL + FR)" and ("nl" in st.session_state["photo_zip"]) and ("fr" in st.session_state["photo_zip"]):
-            st.info("Building combined ZIP…")
-            combo = io.BytesIO()
-            with zipfile.ZipFile(combo, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-                with zipfile.ZipFile(io.BytesIO(st.session_state["photo_zip"]["nl"])) as znl:
-                    for name in znl.namelist():
-                        z.writestr(name, znl.read(name))
-                with zipfile.ZipFile(io.BytesIO(st.session_state["photo_zip"]["fr"])) as zfr:
-                    for name in zfr.namelist():
-                        z.writestr(name, zfr.read(name))
-            st.session_state["photo_zip"]["all"] = combo.getvalue()
-
-# ===============================
-# Downloads (ZIP only, no Excel outputs)
+# Downloads (ZIP only, we do NOT expose Excel downloads)
 # ===============================
 if st.session_state["photo_zip"]:
     ts = time.strftime("%Y%m%d_%H%M%S")

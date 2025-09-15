@@ -75,6 +75,15 @@ if clear_clicked:
                 removed += 1
             except Exception:
                 pass
+    # Also clear Streamlit caches (if used elsewhere)
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
     st.success(f"Cache cleared. Removed {removed} temp folder(s) and reset state.")
 
 # ===============================
@@ -515,16 +524,22 @@ def _hash_bytes(b: bytes) -> str:
 def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> Tuple[bytes, int, int, List[Dict[str, str]]]:
     products_df, photos_df = _read_book(xlsx_bytes)
     id_cnk = _extract_id_cnk(products_df)
-    photos = _extract_photos(photos_df)
+    photos_raw = _extract_photos(photos_df)
 
     id2cnk: Dict[str, str] = {str(row["ID"]).strip(): str(row["CNK"]).strip() for _, row in id_cnk.iterrows()}
+
+    # Track which Product IDs have *any* photo rows in the export (even if URL is missing)
+    try:
+        all_pids_set = set(photos_raw["Product ID"].astype(str).str.strip())
+    except Exception:
+        all_pids_set = set()
 
     def _rank_type(t: str) -> int:
         if not isinstance(t, str):
             return 99
         return TYPE_RANK.get(t.strip().lower(), 99)
 
-    photos = photos.dropna(subset=["URL"]).copy()
+    photos = photos_raw.dropna(subset=["URL"]).copy()
     photos["rank_type"] = photos["Type"].map(_rank_type)
     photos["rank_photoid"] = pd.to_numeric(photos["Photo ID"], errors="coerce").fillna(10**9).astype(int)
     photos.sort_values(["Product ID", "rank_type", "rank_photoid"], inplace=True)
@@ -583,6 +598,11 @@ def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> T
         if frac - last_update >= 0.01:
             progress.progress(min(1.0, frac))
             last_update = frac
+
+    # After processing, mark products that had *no* photo rows at all
+    for pid, cnk in id2cnk.items():
+        if pid not in all_pids_set:
+            missing.append({"Product ID": pid, "CNK": cnk, "URL": None, "Reason": "No photos in export"})
 
     zf.close()
     return zip_buf.getvalue(), attempted, saved, missing
@@ -671,14 +691,6 @@ if submitted:
             main_prog.progress(1.0)
 
             if scope == "All (NL + FR)" and ("nl" in st.session_state["photo_zip"] or "fr" in st.session_state["photo_zip"]):
-                combo = io.BytesIO()
-                with zipfile.ZipFile(combo, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-                    for lg in ("nl", "fr"):
-                        if lg in st.session_state["photo_zip"]:
-                            with zipfile.ZipFile(io.BytesIO(st.session_state["photo_zip"][lg])) as zlg:
-                                for name in zlg.namelist():
-                                    z.writestr(name, zlg.read(name))
-                st.session_state["photo_zip"]["all"] = combo.getvalue()ip"] or "fr" in st.session_state["photo_zip"]):
                 combo = io.BytesIO()
                 with zipfile.ZipFile(combo, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
                     for lg in ("nl", "fr"):

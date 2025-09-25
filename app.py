@@ -9,6 +9,7 @@ import hashlib
 import zipfile
 from typing import Dict, List, Tuple, Optional
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import streamlit as st
@@ -75,7 +76,7 @@ if clear_clicked:
                 removed += 1
             except Exception:
                 pass
-    # Also clear Streamlit caches (if used elsewhere)
+    # Also clear Streamlit caches
     try:
         st.cache_data.clear()
     except Exception:
@@ -244,7 +245,7 @@ def wait_for_xlsx_on_disk(ctx, start_time: float, timeout=60) -> pathlib.Path | 
     return None
 
 
-def try_save_xlsx_from_perflog(ctx, timeout=12) -> bytes | None:
+def try_save_xlsx_from_perflog(ctx, timeout=15) -> bytes | None:
     drv = ctx["driver"]
     deadline = time.time() + timeout
     seen = set()
@@ -281,7 +282,7 @@ def try_save_xlsx_from_perflog(ctx, timeout=12) -> bytes | None:
                     return raw
                 except Exception:
                     pass
-        time.sleep(0.4)
+        time.sleep(0.3)
     return None
 
 
@@ -340,7 +341,7 @@ def run_export_and_get_bytes(ctx, lang: str, refs: str) -> bytes | None:
     disk = wait_for_xlsx_on_disk(ctx, start_time=start, timeout=60)
     if disk and disk.exists():
         return disk.read_bytes()
-    return try_save_xlsx_from_perflog(ctx, timeout=12)
+    return try_save_xlsx_from_perflog(ctx, timeout=15)
 
 
 def do_login(ctx, email_addr: str, pwd: str):
@@ -357,27 +358,6 @@ def do_login(ctx, email_addr: str, pwd: str):
         wait.until(EC.invisibility_of_element_located((By.ID, "form0.email")))
     except TimeoutException:
         pass
-
-
-def run_exports(email: str, password: str, refs: str, langs: List[str]):
-    results = {}
-    for lang in langs:
-        with st.spinner(f"Running {lang.upper()} export…"):
-            tmpdir = tempfile.mkdtemp(prefix=f"medipim_{lang}_")
-            ctx = make_ctx(tmpdir)
-            try:
-                do_login(ctx, email, password)
-                data = run_export_and_get_bytes(ctx, lang, refs)
-                if data:
-                    results[lang] = data
-                else:
-                    st.error(f"{lang.upper()} export failed: no XLSX found.")
-            finally:
-                try:
-                    ctx["driver"].quit()
-                except Exception:
-                    pass
-    return results
 
 # ===============================
 # SKU parsing (always deduplicated)
@@ -404,7 +384,7 @@ def parse_skus(sku_text: str, uploaded_file) -> List[str]:
     return out
 
 # ===============================
-# Photo processing
+# Photo processing — constants
 # ===============================
 DEDUP_DHASH_THRESHOLD = 3  # Hamming distance threshold for perceptual dedup (0..64)
 TYPE_RANK = {
@@ -416,7 +396,9 @@ TYPE_RANK = {
     "sfeerbeeld": 3,
 }
 
-
+# ===============================
+# Helpers: Excel parse
+# ===============================
 def _read_book(xlsx_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame]:
     xl = pd.ExcelFile(io.BytesIO(xlsx_bytes))
     products = xl.parse(xl.sheet_names[0])
@@ -461,17 +443,49 @@ def _extract_photos(photos_df: pd.DataFrame) -> pd.DataFrame:
     out["Photo ID"] = pd.to_numeric(df[photoid_col], errors="coerce") if photoid_col else None
     return out
 
+# ===============================
+# Image helpers (cached & parallel)
+# ===============================
 
-def _download_image(url: str):
+@st.cache_data(show_spinner=False, ttl=24*3600, max_entries=10000)
+def _fetch_url_cached(url: str) -> Optional[bytes]:
+    """Scarica e cache-a i bytes dell'immagine per URL (cache 24h)."""
     try:
         r = requests.get(url, timeout=15)
         if r.status_code != 200 or not r.content:
             return None
-        img = Image.open(io.BytesIO(r.content))
-        img.load()
-        return img
+        return r.content
     except Exception:
         return None
+
+
+def _download_many(urls: List[str], progress: Optional[st.progress] = None, max_workers: int = 16) -> Dict[str, Optional[bytes]]:
+    """Scarica in parallelo gli URL, usando la cache per ogni URL."""
+    results: Dict[str, Optional[bytes]] = {}
+    total = len(urls)
+    done = 0
+    next_update = 0.0
+
+    def task(u):
+        return u, _fetch_url_cached(u)
+
+    if total == 0:
+        return results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(task, u) for u in urls]
+        for f in as_completed(futures):
+            u, content = f.result()
+            results[u] = content
+            done += 1
+            frac = done / total
+            if progress and frac >= next_update:
+                progress.progress(min(1.0, frac))
+                next_update += 0.05  # update ogni 5%
+
+    if progress:
+        progress.progress(1.0)
+    return results
 
 
 def _to_1000_canvas(img: Image.Image) -> Image.Image:
@@ -491,7 +505,8 @@ def _to_1000_canvas(img: Image.Image) -> Image.Image:
 
 def _jpeg_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=92, optimize=True)
+    # qualità leggermente più bassa per velocità/dimensione (prima era 92)
+    img.save(buf, format="JPEG", quality=85, optimize=True)
     return buf.getvalue()
 
 
@@ -521,14 +536,78 @@ def _hash_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
 
-def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> Tuple[bytes, int, int, List[Dict[str, str]]]:
+def _process_one(url: str, content: Optional[bytes]) -> Tuple[str, Optional[Tuple[bytes, int, str]]]:
+    """Elabora un'immagine (bytes → canvas 1000 → jpeg → dhash/md5)."""
+    if content is None:
+        return url, None
+    try:
+        img = Image.open(io.BytesIO(content))
+        img.load()
+        processed = _to_1000_canvas(img)
+        dh = _dhash(processed, hash_size=8)
+        jb = _jpeg_bytes(processed)
+        md5 = _hash_bytes(jb)
+        return url, (jb, dh, md5)
+    except Exception:
+        return url, None
+
+
+def _process_many(urls: List[str], contents: Dict[str, Optional[bytes]], progress: Optional[st.progress] = None, max_workers: int = 16) -> Dict[str, Optional[Tuple[bytes, int, str]]]:
+    """Elabora in parallelo i contenuti scaricati."""
+    results: Dict[str, Optional[Tuple[bytes, int, str]]] = {}
+    total = len(urls)
+    done = 0
+    next_update = 0.0
+
+    if total == 0:
+        return results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_process_one, u, contents.get(u)) for u in urls]
+        for f in as_completed(futures):
+            u, triple = f.result()
+            results[u] = triple
+            done += 1
+            frac = done / total
+            if progress and frac >= next_update:
+                progress.progress(min(1.0, frac))
+                next_update += 0.05
+
+    if progress:
+        progress.progress(1.0)
+    return results
+
+# ===============================
+# Build ZIP (refactored for parallel)
+# ===============================
+class ScaledProgress:
+    """Proxy around a single Streamlit progress bar, scaled to a [start,end] window."""
+    def __init__(self, widget, start: float, end: float):
+        self.widget = widget
+        self.start = float(start)
+        self.end = float(end)
+    def progress(self, frac: float):
+        frac = max(0.0, min(1.0, float(frac)))
+        val = self.start + (self.end - self.start) * frac
+        self.widget.progress(min(1.0, max(0.0, val)))
+
+
+def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: ScaledProgress) -> Tuple[bytes, int, int, List[Dict[str, str]]]:
+    """
+    Nuova pipeline:
+      1) Parse/sort dei record con URL (come prima)
+      2) Download in parallelo (cache)
+      3) Processing in parallelo (canvas+hash)
+      4) Dedup per CNK mantenendo l'ordine/priority
+      5) Scrittura ZIP
+    """
     products_df, photos_df = _read_book(xlsx_bytes)
     id_cnk = _extract_id_cnk(products_df)
     photos_raw = _extract_photos(photos_df)
 
     id2cnk: Dict[str, str] = {str(row["ID"]).strip(): str(row["CNK"]).strip() for _, row in id_cnk.iterrows()}
 
-    # Track which Product IDs have *any* photo rows in the export (even if URL is missing)
+    # Track Product IDs presenti nella sheet Photos (anche senza URL)
     try:
         all_pids_set = set(photos_raw["Product ID"].astype(str).str.strip())
     except Exception:
@@ -544,6 +623,31 @@ def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> T
     photos["rank_photoid"] = pd.to_numeric(photos["Photo ID"], errors="coerce").fillna(10**9).astype(int)
     photos.sort_values(["Product ID", "rank_type", "rank_photoid"], inplace=True)
 
+    # Prepara lista di record
+    records = []
+    for _, r in photos.iterrows():
+        pid = str(r["Product ID"]).strip()
+        url = str(r["URL"]).strip()
+        cnk = id2cnk.get(pid)
+        records.append({
+            "pid": pid,
+            "cnk": cnk,
+            "url": url,
+            "rank_type": int(r["rank_type"]),
+            "rank_photoid": int(r["rank_photoid"]),
+        })
+
+    # Fase 2a: download parallelo (0%→40% della finestra)
+    dl_prog = ScaledProgress(progress.widget, progress.start, progress.start + (progress.end - progress.start) * 0.40)
+    url_list = [rec["url"] for rec in records]
+    url_contents = _download_many(url_list, progress=dl_prog, max_workers=16)
+
+    # Fase 2b: processing parallelo (40%→85% della finestra)
+    pr_prog = ScaledProgress(progress.widget, progress.start + (progress.end - progress.start) * 0.40, progress.start + (progress.end - progress.start) * 0.85)
+    processed_map = _process_many(url_list, url_contents, progress=pr_prog, max_workers=16)
+
+    # Fase 3: dedup e scrittura ZIP (85%→100%)
+    zip_prog = ScaledProgress(progress.widget, progress.start + (progress.end - progress.start) * 0.85, progress.end)
     zip_buf = io.BytesIO()
     zf = zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED)
 
@@ -553,51 +657,73 @@ def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> T
     cnk_phashes: Dict[str, List[int]] = {}
     missing: List[Dict[str, str]] = []
 
-    total = len(photos)
-    last_update = 0
+    total = len(records)
+    done = 0
+    next_update = 0.0
 
-    for _, r in photos.iterrows():
+    for rec in records:
         attempted += 1
-        pid = str(r["Product ID"]).strip()
-        url = str(r["URL"]).strip()
-        cnk = id2cnk.get(pid)
+        pid = rec["pid"]
+        cnk = rec["cnk"]
+        url = rec["url"]
+
         if not cnk:
             missing.append({"Product ID": pid, "CNK": None, "URL": url, "Reason": "No CNK"})
+            # progress update cadenzato
+            done += 1
+            frac = done / max(1, total)
+            if frac >= next_update:
+                zip_prog.progress(frac)
+                next_update += 0.05
             continue
 
-        img = _download_image(url)
-        if img is None:
-            missing.append({"Product ID": pid, "CNK": cnk, "URL": url, "Reason": "Download failed"})
+        triple = processed_map.get(url)
+        if not triple:
+            # o download fallito o processing fallito
+            reason = "Download failed" if url_contents.get(url) is None else "Processing failed"
+            missing.append({"Product ID": pid, "CNK": cnk, "URL": url, "Reason": reason})
+            done += 1
+            frac = done / max(1, total)
+            if frac >= next_update:
+                zip_prog.progress(frac)
+                next_update += 0.05
             continue
 
-        processed = _to_1000_canvas(img)
-        dh = _dhash(processed, hash_size=8)  # 64-bit perceptual hash
-        jb = _jpeg_bytes(processed)
-        h = _hash_bytes(jb)
+        jb, dh, md5 = triple
 
         if cnk not in cnk_hashes:
             cnk_hashes[cnk] = set()
         if cnk not in cnk_phashes:
             cnk_phashes[cnk] = []
 
-        # Exact duplicate (identical bytes)
-        if h in cnk_hashes[cnk]:
+        # dedup: identico/near-duplicate
+        if md5 in cnk_hashes[cnk]:
+            done += 1
+            frac = done / max(1, total)
+            if frac >= next_update:
+                zip_prog.progress(frac)
+                next_update += 0.05
             continue
-        # Near-duplicate (perceptual dHash within threshold)
         if any(_hamming(dh, existing) <= DEDUP_DHASH_THRESHOLD for existing in cnk_phashes[cnk]):
+            done += 1
+            frac = done / max(1, total)
+            if frac >= next_update:
+                zip_prog.progress(frac)
+                next_update += 0.05
             continue
 
-        cnk_hashes[cnk].add(h)
+        cnk_hashes[cnk].add(md5)
         cnk_phashes[cnk].append(dh)
         n = len(cnk_hashes[cnk])
         filename = f"BE0{cnk}-{lang}-h{n}.jpg"
         zf.writestr(filename, jb)
         saved += 1
 
-        frac = attempted / max(1, total)
-        if frac - last_update >= 0.01:
-            progress.progress(min(1.0, frac))
-            last_update = frac
+        done += 1
+        frac = done / max(1, total)
+        if frac >= next_update:
+            zip_prog.progress(frac)
+            next_update += 0.05
 
     # After processing, mark products that had *no* photo rows at all
     for pid, cnk in id2cnk.items():
@@ -605,48 +731,47 @@ def build_zip_for_lang(xlsx_bytes: bytes, lang: str, progress: st.progress) -> T
             missing.append({"Product ID": pid, "CNK": cnk, "URL": None, "Reason": "No photos in export"})
 
     zf.close()
+    zip_prog.progress(1.0)
+
     return zip_buf.getvalue(), attempted, saved, missing
 
 # ===============================
-# Orchestrator
+# Orchestrator — single session for NL/FR
 # ===============================
-
-class ScaledProgress:
-    """Proxy around a single Streamlit progress bar, scaled to a [start,end] window."""
-    def __init__(self, widget, start: float, end: float):
-        self.widget = widget
-        self.start = float(start)
-        self.end = float(end)
-    def progress(self, frac: float):
-        frac = max(0.0, min(1.0, float(frac)))
-        val = self.start + (self.end - self.start) * frac
-        self.widget.progress(min(1.0, max(0.0, val)))
-
-
-def run_exports_with_progress(email: str, password: str, refs: str, langs: List[str], prog_widget, start: float, end: float):
-    """Run exports for given languages, updating a single progress bar.
-    Returns {lang: xlsx_bytes}.
+def run_exports_with_progress_single_session(email: str, password: str, refs: str, langs: List[str], prog_widget, start: float, end: float):
+    """
+    Crea una sola sessione Chrome, fa login una volta, e poi esegue gli export
+    per tutte le lingue richieste cambiando lingua al volo.
     """
     results = {}
-    step = (end - start) / max(1, len(langs))
-    for i, lang in enumerate(langs):
-        prog_widget.progress(start + step * i)
-        tmpdir = tempfile.mkdtemp(prefix=f"medipim_{lang}_")
-        ctx = make_ctx(tmpdir)
-        try:
-            do_login(ctx, email, password)
+    tmpdir = tempfile.mkdtemp(prefix="medipim_all_")
+    ctx = make_ctx(tmpdir)
+    try:
+        do_login(ctx, email, password)
+        step = (end - start) / max(1, len(langs))
+        for i, lang in enumerate(langs):
+            prog_widget.progress(start + step * i)
             data = run_export_and_get_bytes(ctx, lang, refs)
             if data:
                 results[lang] = data
             else:
                 st.error(f"{lang.upper()} export failed: no XLSX found.")
-        finally:
-            try:
-                ctx["driver"].quit()
-            except Exception:
-                pass
-        prog_widget.progress(start + step * (i + 1))
+            prog_widget.progress(start + step * (i + 1))
+    finally:
+        try:
+            ctx["driver"].quit()
+        except Exception:
+            pass
+        # pulizia tempdir chrome
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
     return results
+
+# ===============================
+# Main submit flow
+# ===============================
 if submitted:
     st.session_state["exports"] = {}
     st.session_state["photo_zip"] = {}
@@ -671,7 +796,7 @@ if submitted:
             main_prog = st.progress(0.0)
             # Phase 1: exports (0.0 → 0.5 if one lang, 0.0 → 0.6 if two)
             export_end = 0.5 if len(langs) == 1 else 0.6
-            results = run_exports_with_progress(email, password, refs, langs, main_prog, 0.0, export_end)
+            results = run_exports_with_progress_single_session(email, password, refs, langs, main_prog, 0.0, export_end)
             if not results:
                 st.stop()
 

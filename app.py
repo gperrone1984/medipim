@@ -49,9 +49,9 @@ with st.form("login_form", clear_on_submit=False):
 
     st.subheader("SKU input")
     sku_text = st.text_area(
-        "Paste SKUs or CNK code (separated by spaces, commas, or newlines)",
+        "Paste SKUs (separated by spaces, commas, or newlines)",
         height=120,
-        placeholder="e.g. BE04811337 or 4811337",
+        placeholder="e.g. BE03678976 0004811337\nFR4811329",
     )
     uploaded_skus = st.file_uploader("Or upload an Excel with a 'sku' column (optional)", type=["xlsx"], key="xls_skus")
 
@@ -118,24 +118,10 @@ def make_ctx(download_dir: str):
     try:
         driver = webdriver.Chrome(options=opt)
     except WebDriverException as e_a:
-        chromebin = "/usr/bin/chromium"
-        chromedrv = "/usr/bin/chromedriver"
-        if os.path.exists(chromebin) and os.path.exists(chromedrv):
-            opt = build_options()
-            opt.binary_location = chromebin
-            service = Service(chromedrv)
-            driver = webdriver.Chrome(service=service, options=opt)
-        else:
-            raise WebDriverException(f"Chrome failed to start: {e_a}") from e_a
-
+        st.error("At the moment it is not possible to download the images, please try again later.")
+        raise
     wait = WebDriverWait(driver, 40)
     actions = ActionChains(driver)
-
-    try: driver.execute_cdp_cmd("Network.enable", {})
-    except Exception: pass
-    try: driver.execute_cdp_cmd("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": download_dir})
-    except Exception: pass
-
     return {"driver": driver, "wait": wait, "actions": actions, "download_dir": download_dir}
 
 def handle_cookies(ctx):
@@ -154,183 +140,66 @@ def handle_cookies(ctx):
         except Exception:
             pass
 
-def ensure_language(ctx, lang: str):  # 'nl' or 'fr'
+def ensure_language(ctx, lang: str):
     drv, wait = ctx["driver"], ctx["wait"]
-    base = f"https://platform.medipim.be/{'nl/home' if lang=='nl' else 'fr/home'}"
-    drv.get(base)
-    handle_cookies(ctx)
     try:
-        trig_span = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".I18nMenu .Dropdown > button.trigger span")))
-        current = trig_span.text.strip().lower()
-    except TimeoutException:
-        current = ""
-    if current != lang:
-        try:
-            trig = drv.find_element(By.CSS_SELECTOR, ".I18nMenu .Dropdown > button.trigger")
-            drv.execute_script("arguments[0].click();", trig); time.sleep(0.2)
-            if lang == "nl":
-                lang_link = wait.until(EC.element_to_be_clickable((By.XPATH, "//div[contains(@class,'I18nMenu')]//a[contains(@href,'/nl/')]")))
-            else:
-                lang_link = wait.until(EC.element_to_be_clickable((By.XPATH, "//div[contains(@class,'I18nMenu')]//a[contains(@href,'/fr/')]")))
-            drv.execute_script("arguments[0].click();", lang_link); time.sleep(0.4)
-        except TimeoutException:
-            pass
+        base = f"https://platform.medipim.be/{'nl/home' if lang=='nl' else 'fr/home'}"
+        drv.get(base)
+        handle_cookies(ctx)
+    except Exception:
+        st.error("At the moment it is not possible to download the images, please try again later.")
+        raise
 
 def open_export_dropdown(ctx):
     drv, wait = ctx["driver"], ctx["wait"]
-    split = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.SplitButton")))
-    trigger = split.find_element(By.CSS_SELECTOR, "button.trigger")
-    for _ in range(4):
-        if trigger.get_attribute("aria-expanded") == "true":
-            break
+    try:
+        split = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.SplitButton")))
+        trigger = split.find_element(By.CSS_SELECTOR, "button.trigger")
         drv.execute_script("arguments[0].click();", trigger); time.sleep(0.25)
-    if trigger.get_attribute("aria-expanded") != "true":
-        raise TimeoutException("Export dropdown did not open.")
-    dd = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.Dropdown.open div.dropdown")))
-    return dd
-
-def click_excel_option(ctx, dropdown):
-    actions = ctx["actions"]
-    excel_btn = dropdown.find_element(By.CSS_SELECTOR, "div.actions > button:nth-of-type(2)")
-    try:
-        actions.move_to_element(excel_btn).pause(0.1).click().perform()
-    except Exception:
-        ctx["driver"].execute_script("arguments[0].click();", excel_btn)
-
-def select_all_attributes(ctx):
-    drv = ctx["driver"]
-    try:
-        all_attr = WebDriverWait(drv, 8).until(
-            EC.element_to_be_clickable((By.XPATH,
-                "//a[contains(., 'Alles selecteren')] | //button[contains(., 'Alles selecteren')] | "
-                "//a[contains(., 'Sélectionner tout') or contains(., 'Selectionner tout')] | "
-                "//button[contains(., 'Sélectionner tout') or contains(., 'Selectionner tout')] | "
-                "//button[contains(., 'Select all')] | //a[contains(., 'Select all')]"
-            ))
-        )
-        drv.execute_script("arguments[0].click();", all_attr)
+        dd = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.Dropdown.open div.dropdown")))
+        return dd
     except TimeoutException:
-        pass
-
-def wait_for_xlsx_on_disk(ctx, start_time: float, timeout=60) -> pathlib.Path | None:
-    download_dir = ctx["download_dir"]
-    end = time.time() + timeout
-    margin = 2.0
-    while time.time() < end:
-        files = [
-            (f, os.path.getmtime(os.path.join(download_dir, f)))
-            for f in os.listdir(download_dir)
-            if f.lower().endswith(".xlsx")
-        ]
-        fresh = [f for f, m in files if m >= (start_time - margin)]
-        if fresh:
-            fresh.sort(key=lambda f: os.path.getmtime(os.path.join(download_dir, f)), reverse=True)
-            return pathlib.Path(os.path.join(download_dir, fresh[0]))
-        time.sleep(0.5)
-    return None
-
-def try_save_xlsx_from_perflog(ctx, timeout=15) -> bytes | None:
-    drv = ctx["driver"]
-    deadline = time.time() + timeout
-    seen = set()
-    try:
-        drv.execute_cdp_cmd("Network.enable", {})
-    except Exception:
-        pass
-    while time.time() < deadline:
-        try:
-            logs = drv.get_log('performance')
-        except Exception:
-            logs = []
-        for entry in logs:
-            try:
-                payload = json.loads(entry.get('message', '{}'))
-                m = payload.get("message", {})
-            except Exception:
-                continue
-            if m.get("method") != "Network.responseReceived":
-                continue
-            params = m.get("params", {})
-            resp = params.get("response", {})
-            req_id = params.get("requestId")
-            if not req_id or req_id in seen:
-                continue
-            seen.add(req_id)
-            mime = (resp.get("mimeType") or "").lower()
-            url  = (resp.get("url") or "").lower()
-            if ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in mime) or url.endswith(".xlsx"):
-                try:
-                    body = drv.execute_cdp_cmd('Network.getResponseBody', {'requestId': req_id})
-                    data = body.get('body', '')
-                    raw = base64.b64decode(data) if body.get('base64Encoded') else data.encode('utf-8', 'ignore')
-                    return raw
-                except Exception:
-                    pass
-        time.sleep(0.3)
-    return None
+        st.error("At the moment it is not possible to download the images, please try again later.")
+        return None
 
 def run_export_and_get_bytes(ctx, lang: str, refs: str) -> bytes | None:
-    ensure_language(ctx, lang)
-    if lang == "nl":
-        url = f"https://platform.medipim.be/nl/producten?search=refcode[{refs.replace(' ', '%20')}]"
-    else:
-        url = f"https://platform.medipim.be/fr/produits?search=refcode[{refs.replace(' ', '%20')}]"
-
-    drv, wait = ctx["driver"], ctx["wait"]
-    drv.get(url)
-    handle_cookies(ctx)
-
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.SplitButton")))
-    dd = open_export_dropdown(ctx)
-    click_excel_option(ctx, dd)
-
-    select_all_attributes(ctx)
-
     try:
-        create_btn = WebDriverWait(drv, 25).until(
-            EC.element_to_be_clickable((By.XPATH,
-                "//button[contains(., 'AANMAKEN')] | //button[contains(., 'Aanmaken')] | "
-                "//button[contains(., 'Create')] | "
-                "//button[contains(., 'Créer') or contains(., 'Creer')]"
-            ))
-        )
+        ensure_language(ctx, lang)
+        if lang == "nl":
+            url = f"https://platform.medipim.be/nl/producten?search=refcode[{refs.replace(' ', '%20')}]"
+        else:
+            url = f"https://platform.medipim.be/fr/produits?search=refcode[{refs.replace(' ', '%20')}]"
+        drv, wait = ctx["driver"], ctx["wait"]
+        drv.get(url)
+        handle_cookies(ctx)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.SplitButton")))
+        dd = open_export_dropdown(ctx)
+        if dd is None:
+            return None
+        click_excel_option(ctx, dd)
+        select_all_attributes(ctx)
+        create_btn = WebDriverWait(drv, 25).until(EC.element_to_be_clickable((By.XPATH,"//button[contains(., 'Create')] | //button[contains(., 'Créer')] | //button[contains(., 'Aanmaken')]")))
         drv.execute_script("arguments[0].click();", create_btn)
-    except TimeoutException:
-        pass
-
-    try:
-        WebDriverWait(drv, 40).until(
-            EC.presence_of_element_located((By.XPATH,
-                "//*[contains(., 'Export is klaar') or contains(., 'Export gereed') or "
-                "contains(., 'Export ready') or contains(., 'Export prêt') or contains(., 'Export est prêt')]"
-            ))
-        )
-    except TimeoutException:
-        pass
-
-    dl = wait.until(EC.element_to_be_clickable((By.XPATH,
-        "//button[contains(., 'DOWNLOAD')] | //a[contains(., 'DOWNLOAD')] | "
-        "//button[contains(., 'Download')] | //a[contains(., 'Download')] | "
-        "//button[contains(., 'Télécharger') or contains(., 'Telecharger')] | "
-        "//a[contains(., 'Télécharger') or contains(., 'Telecharger')]"
-    )))
-    href = (dl.get_attribute("href") or dl.get_attribute("data-href") or "").strip().lower()
-    start = time.time()
-    if href and (not href.startswith("javascript")) and (not href.startswith("blob:")):
-        drv.get(href)
-    else:
-        drv.execute_script("arguments[0].click();", dl)
-
-    disk = wait_for_xlsx_on_disk(ctx, start_time=start, timeout=60)
-    if disk and disk.exists():
-        return disk.read_bytes()
-    return try_save_xlsx_from_perflog(ctx, timeout=15)
+        WebDriverWait(drv, 40).until(EC.presence_of_element_located((By.XPATH,"//*[contains(., 'Export')]")))
+        dl = wait.until(EC.element_to_be_clickable((By.XPATH,"//button[contains(., 'DOWNLOAD')] | //a[contains(., 'Download')] | //button[contains(., 'Télécharger')]")))
+        href = (dl.get_attribute("href") or dl.get_attribute("data-href") or "").strip().lower()
+        start = time.time()
+        if href and (not href.startswith("javascript")) and (not href.startswith("blob:")):
+            drv.get(href)
+        else:
+            drv.execute_script("arguments[0].click();", dl)
+        disk = wait_for_xlsx_on_disk(ctx, start_time=start, timeout=60)
+        if disk and disk.exists():
+            return disk.read_bytes()
+    except Exception:
+        st.error("At the moment it is not possible to download the images, please try again later.")
+    return None
 
 def do_login(ctx, email_addr: str, pwd: str):
     drv, wait = ctx["driver"], ctx["wait"]
-    drv.get("https://platform.medipim.be/nl/inloggen")
-    handle_cookies(ctx)
     try:
+        drv.get("https://platform.medipim.be/nl/inloggen")
+        handle_cookies(ctx)
         email_el = wait.until(EC.presence_of_element_located((By.ID, "form0.email")))
         pwd_el   = wait.until(EC.presence_of_element_located((By.ID, "form0.password")))
         email_el.clear(); email_el.send_keys(email_addr)
@@ -338,8 +207,9 @@ def do_login(ctx, email_addr: str, pwd: str):
         submit = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.SubmitButton")))
         drv.execute_script("arguments[0].click();", submit)
         wait.until(EC.invisibility_of_element_located((By.ID, "form0.email")))
-    except TimeoutException:
-        pass
+    except Exception:
+        st.error("At the moment it is not possible to download the images, please try again later.")
+        raise
 
 # ===============================
 # SKU parsing (normalizzata)

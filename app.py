@@ -49,9 +49,9 @@ with st.form("login_form", clear_on_submit=False):
 
     st.subheader("SKU input")
     sku_text = st.text_area(
-        "Paste SKUs (separated by spaces, commas, or newlines)",
+        "Paste SKUs or CNK code (separated by spaces, commas, or newlines)",
         height=120,
-        placeholder="e.g. 4811337 4811352\n4811329, 4811345",
+        placeholder="e.g. BE04811337 or 4811337",
     )
     uploaded_skus = st.file_uploader("Or upload an Excel with a 'sku' column (optional)", type=["xlsx"], key="xls_skus")
 
